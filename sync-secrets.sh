@@ -59,16 +59,13 @@ fi
 
 source "$CONFIG_FILE"
 
-# Get secret keys from .env.example
+# Get secret keys from .env
 get_secret_keys() {
-    local env_example="$REPO_PATH/.env.example"
     local env_file="$REPO_PATH/.env"
     local env_local="$REPO_PATH/.env.local"
 
     local source_file=""
-    if [[ -f "$env_example" ]]; then
-        source_file="$env_example"
-    elif [[ -f "$env_file" ]]; then
+    if [[ -f "$env_file" ]]; then
         source_file="$env_file"
     elif [[ -f "$env_local" ]]; then
         source_file="$env_local"
@@ -276,14 +273,14 @@ if [[ "$ENV" == "dev" ]]; then
 else
     # STAGING/PROD: Prompt for each value
 
-    # Get list of keys from .env.example or existing secrets
+    # Get list of keys from .env or existing BWS secrets
     KEYS=()
 
-    if keys_from_example=$(get_secret_keys); then
+    if keys_from_env=$(get_secret_keys); then
         while IFS= read -r key; do
             KEYS+=("$key")
-        done <<< "$keys_from_example"
-        log_info "Using keys from .env.example"
+        done <<< "$keys_from_env"
+        log_info "Using keys from .env"
     else
         # Fall back to existing secrets in BWS
         while IFS= read -r key; do
@@ -293,7 +290,7 @@ else
     fi
 
     if [[ ${#KEYS[@]} -eq 0 ]]; then
-        log_error "No keys found. Create .env.example first."
+        log_error "No keys found. Create a .env file first."
         exit 1
     fi
 

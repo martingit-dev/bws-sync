@@ -160,12 +160,12 @@ This ensures every developer has the same, up-to-date secrets without sharing `.
 
 ### How It Determines Secret Keys
 
-The script looks for keys in this order:
+`.env` is the single source of truth for secret keys. The script uses it for all operations:
 
-1. `.env.example` — preferred, should list all required variables
-2. `.env` — fallback for dev
-3. `.env.local` — fallback for dev
-4. Existing BWS secrets — fallback for staging/production
+1. **Push dev** — reads keys and values from `.env`
+2. **Push staging/production** — reads keys from `.env`, prompts for environment-specific values (skip keys that don't apply by pressing Enter)
+3. **Pull dev** — downloads all keys and values from BWS, writes to `.env`
+4. Falls back to `.env.local` if `.env` doesn't exist, or existing BWS secrets for subsequent updates
 
 ### GitHub Actions Integration
 
