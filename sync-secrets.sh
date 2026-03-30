@@ -59,16 +59,21 @@ fi
 
 source "$CONFIG_FILE"
 
-# Get secret keys from .env
+# Get secret keys from .env (falls back to .env.local, then .env.example)
 get_secret_keys() {
     local env_file="$REPO_PATH/.env"
     local env_local="$REPO_PATH/.env.local"
+    local env_example="$REPO_PATH/.env.example"
 
     local source_file=""
     if [[ -f "$env_file" ]]; then
         source_file="$env_file"
     elif [[ -f "$env_local" ]]; then
         source_file="$env_local"
+    elif [[ -f "$env_example" ]]; then
+        log_warn "No .env found — falling back to .env.example"
+        log_warn "Create a .env with real values, then push to BWS"
+        source_file="$env_example"
     fi
 
     if [[ -z "$source_file" ]]; then
@@ -229,7 +234,12 @@ if [[ "$ENV" == "dev" ]]; then
     fi
 
     if [[ ! -f "$ENV_FILE" ]]; then
-        log_error "No .env or .env.local found"
+        if [[ -f "$REPO_PATH/.env.example" ]]; then
+            log_error "No .env found. Copy .env.example and fill in real values:"
+            echo "  cp $REPO_PATH/.env.example $REPO_PATH/.env"
+        else
+            log_error "No .env found. Create one with your secret values first."
+        fi
         exit 1
     fi
 
