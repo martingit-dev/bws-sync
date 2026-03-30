@@ -114,19 +114,21 @@ parse_env_file() {
 echo ""
 log_info "Repository: $REPO_NAME"
 
-# Select environment
+# Select action
 echo ""
-echo "Select environment:"
-echo "  1) dev        - Sync from .env file"
-echo "  2) staging    - Enter values manually"
-echo "  3) production - Enter values manually"
+echo "Select action:"
+echo "  1) push dev        - Upload .env to BWS"
+echo "  2) push staging    - Enter values manually"
+echo "  3) push production - Enter values manually"
+echo "  4) pull dev        - Download secrets from BWS to .env"
 echo ""
-read -p "Choice [1-3]: " env_choice
+read -p "Choice [1-4]: " env_choice
 
 case $env_choice in
-    1) ENV="dev" ;;
-    2) ENV="staging" ;;
-    3) ENV="production" ;;
+    1) ENV="dev"; ACTION="push" ;;
+    2) ENV="staging"; ACTION="push" ;;
+    3) ENV="production"; ACTION="push" ;;
+    4) ENV="dev"; ACTION="pull" ;;
     *) log_error "Invalid choice"; exit 1 ;;
 esac
 
@@ -163,8 +165,59 @@ log_info "Fetching existing secrets..."
 EXISTING=$(bws secret list "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json || echo "[]")
 
 echo ""
+
+# PULL MODE: Download secrets from BWS to .env
+if [[ "$ACTION" == "pull" ]]; then
+    SECRET_COUNT=$(echo "$EXISTING" | jq 'length')
+
+    if [[ "$SECRET_COUNT" -eq 0 || "$SECRET_COUNT" == "null" ]]; then
+        log_error "No secrets found in this project"
+        exit 1
+    fi
+
+    log_info "Found $SECRET_COUNT secrets in BWS"
+
+    ENV_FILE="$REPO_PATH/.env"
+
+    # Show what will be written
+    echo ""
+    echo "Secrets to write:"
+    echo "$EXISTING" | jq -r '.[].key' | sort | while read -r key; do
+        echo "  - $key"
+    done
+    echo ""
+
+    if [[ -f "$ENV_FILE" ]]; then
+        log_warn ".env already exists — it will be overwritten"
+    else
+        log_info ".env will be created"
+    fi
+
+    read -p "Continue? [y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 0
+
+    # Write .env file
+    echo "# Generated from Bitwarden Secrets Manager" > "$ENV_FILE"
+    echo "# Project: $PROJECT_ID | Environment: $ENV" >> "$ENV_FILE"
+    echo "# Pulled: $(date -Iseconds)" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "$EXISTING" | jq -r '.[] | .key + "=" + .value' | sort >> "$ENV_FILE"
+
+    log_success "Written to: $ENV_FILE"
+
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  Pull complete${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "Make sure .env is in your .gitignore!"
+    exit 0
+fi
+
+# PUSH MODE
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  Syncing to: $ENV${NC}"
+echo -e "${GREEN}  Pushing to: $ENV${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 

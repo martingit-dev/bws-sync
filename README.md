@@ -38,6 +38,7 @@
     </li>
     <li><a href="#usage">Usage</a>
       <ul>
+        <li><a href="#pulling-secrets-developer-onboarding">Pulling Secrets (Developer Onboarding)</a></li>
         <li><a href="#how-it-determines-secret-keys">How It Determines Secret Keys</a></li>
         <li><a href="#github-actions-integration">GitHub Actions Integration</a></li>
       </ul>
@@ -56,8 +57,9 @@ Managing secrets across multiple environments and repositories gets messy fast. 
 
 **bws-sync** is a single Bash script that syncs your project secrets into Bitwarden Secrets Manager and wires them into your GitHub Actions workflows automatically.
 
-- **Dev** — reads your `.env` file and bulk-uploads all variables to BWS
-- **Staging / Production** — prompts you for each secret value interactively (like `gh secret set`), then updates your workflow files and GitHub environment configuration
+- **Push dev** — reads your `.env` file and bulk-uploads all variables to BWS
+- **Push staging / production** — prompts you for each secret value interactively, then updates your workflow files and GitHub environment configuration
+- **Pull dev** — downloads secrets from BWS and writes them to `.env` for developer onboarding
 
 ### Why Use bws-sync?
 
@@ -135,12 +137,26 @@ Point the script at your project repository:
 
 The script will interactively walk you through:
 
-1. Select an environment (dev, staging, or production)
+1. Select an action (push or pull) and environment
 2. Enter your BWS Project ID
 3. Validate access to the project
 4. Sync secrets:
-   - **Dev** — reads from `.env` or `.env.local`, lists all variables, and syncs after confirmation
-   - **Staging / Production** — prompts for each value, then updates your workflow file and GitHub environment
+   - **Push dev** — reads from `.env` or `.env.local`, lists all variables, and uploads to BWS
+   - **Push staging / production** — prompts for each value, then updates your workflow file and GitHub environment
+   - **Pull dev** — downloads all secrets from BWS and writes them to `.env`
+
+### Pulling Secrets (Developer Onboarding)
+
+New developers joining a project can pull secrets directly from BWS instead of asking for a `.env` file:
+
+```bash
+./sync-secrets.sh /path/to/your/project
+# Select: 4) pull dev
+# Enter the BWS Project ID
+# Confirm — .env is created/overwritten
+```
+
+This ensures every developer has the same, up-to-date secrets without sharing `.env` files over Slack or email.
 
 ### How It Determines Secret Keys
 
