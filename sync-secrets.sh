@@ -94,6 +94,7 @@ CMD="status"
 ENV="dev"
 REPO_PATH="$PWD"
 ASSUME_YES="no"
+FROM_FILE=""
 KEYS_ARG=()
 
 case "${1:-}" in
@@ -105,6 +106,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -e|--env)  ENV="${2:-}"; shift 2 ;;
         -d|--dir)  REPO_PATH="${2:-}"; shift 2 ;;
+        -f|--from) FROM_FILE="${2:-}"; shift 2 ;;
         -y|--yes)  ASSUME_YES="yes"; shift ;;
         -h|--help) usage 0 ;;
         -*)        die "Unknown flag: $1" ;;
@@ -223,8 +225,13 @@ declare -A LOCAL_VALS=()   # key -> value from .env
 declare -A REMOTE_VALS=()  # key -> value from BWS
 declare -A REMOTE_IDS=()   # key -> BWS secret UUID
 
-parse_env_file() {
-    [[ -f "$ENV_FILE" ]] || return 1
+declare -A FROM_VALS=()   # key -> value from --from file
+
+# parse_env_into <file> <name of associative array>
+parse_env_into() {
+    local file="$1"
+    local -n target="$2"
+    [[ -f "$file" ]] || return 1
     local line key value
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
@@ -235,9 +242,11 @@ parse_env_file() {
         if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
             value="${value:1:${#value}-2}"
         fi
-        LOCAL_VALS["$key"]="$value"
-    done < "$ENV_FILE"
+        target["$key"]="$value"
+    done < "$file"
 }
+
+parse_env_file() { parse_env_into "$ENV_FILE" LOCAL_VALS; }
 
 fetch_remote() {
     log_info "Fetching $ENV secrets from BWS…" >&2
@@ -364,8 +373,44 @@ put_secret() {
     fi
 }
 
+# --from holds plaintext values for an environment whose values are otherwise
+# never on disk. Refuse to read it if git would track it, and offer to destroy
+# it once the values are safely in BWS.
+load_from_file() {
+    [[ -n "$FROM_FILE" ]] || return 0
+    [[ -f "$FROM_FILE" ]] || die "No such file: $FROM_FILE"
+
+    if git -C "$REPO_PATH" rev-parse --git-dir &>/dev/null; then
+        local rel="$FROM_FILE"
+        [[ "$rel" = /* ]] && rel="$(realpath --relative-to="$REPO_PATH" "$FROM_FILE" 2>/dev/null || echo "$FROM_FILE")"
+        if [[ "$rel" != ../* && "$rel" != /* ]] \
+           && ! git -C "$REPO_PATH" check-ignore -q "$rel" 2>/dev/null; then
+            log_error "git is not ignoring $rel — it holds plaintext $ENV secrets"
+            log_error "Add it to .gitignore, or keep the file outside the repo."
+            exit 1
+        fi
+    fi
+
+    parse_env_into "$FROM_FILE" FROM_VALS || die "Could not read $FROM_FILE"
+    (( ${#FROM_VALS[@]} )) || die "No KEY=VALUE lines in $FROM_FILE"
+    log_info "Values from: $FROM_FILE (${#FROM_VALS[@]} keys)"
+}
+
+shred_from_file() {
+    [[ -n "$FROM_FILE" ]] || return 0
+    echo ""
+    log_warn "$FROM_FILE still holds plaintext $ENV secrets — BWS has them now."
+    if confirm "  Delete it?"; then
+        command -v shred &>/dev/null && shred -u "$FROM_FILE" 2>/dev/null || rm -f "$FROM_FILE"
+        log_success "Deleted $FROM_FILE"
+    else
+        log_warn "Left in place. Delete it when you're done."
+    fi
+}
+
 cmd_push() {
     load_state
+    load_from_file
 
     # Bare push acts on drift only. For dev that's new + changed keys. For
     # staging/production we cannot see drift in values, so it's the keys BWS is
@@ -381,38 +426,48 @@ cmd_push() {
 
     (( ${#keys[@]} )) || { log_success "Nothing to push — $ENV has every key in $ENV_FILE_NAME"; return 0; }
 
-    echo ""
-    if [[ "$ENV" == "dev" ]]; then
-        echo "Push to $ENV ($REPO_NAME) — values from $ENV_FILE_NAME:"
-    else
-        echo "Push to $ENV ($REPO_NAME) — you will be prompted for each value:"
-    fi
+    # Where each value will come from, so the confirmation can say so per key.
+    value_source() {
+        if [[ "$ENV" == "dev" ]];              then echo "$ENV_FILE_NAME"
+        elif [[ -n "${FROM_VALS[$1]+x}" ]];    then echo "file"
+        else                                        echo "prompt"; fi
+    }
 
-    local key
+    echo ""
+    echo "Push to $ENV ($REPO_NAME):"
+    local key src prompted=0
     for key in "${keys[@]}"; do
+        src=$(value_source "$key")
+        [[ "$src" == "prompt" ]] && (( ++prompted ))
         if [[ -n "${REMOTE_IDS[$key]:-}" ]]; then
-            echo -e "  ${YELLOW}~${NC} $key ${DIM}(overwrites existing $ENV value)${NC}"
+            echo -e "  ${YELLOW}~${NC} $key ${DIM}($src → overwrites existing $ENV value)${NC}"
         else
-            echo -e "  ${GREEN}+${NC} $key ${DIM}(new)${NC}"
+            echo -e "  ${GREEN}+${NC} $key ${DIM}($src → new)${NC}"
         fi
     done
     echo ""
+    [[ "$ENV" != "dev" && $prompted -gt 0 ]] && log_info "$prompted key(s) will be prompted for"
     confirm "Continue?" || exit 0
     echo ""
 
     local value
     for key in "${keys[@]}"; do
-        if [[ "$ENV" == "dev" ]]; then
-            [[ -n "${LOCAL_VALS[$key]+x}" ]] || { log_warn "skipped $key (not in $ENV_FILE_NAME)"; continue; }
-            put_secret "$key" "${LOCAL_VALS[$key]}"
-        else
-            local hint="new"
-            [[ -n "${REMOTE_IDS[$key]:-}" ]] && hint="Enter to keep current"
-            read -rp "$(echo -e "${CYAN}?${NC} $key ${DIM}($hint)${NC}: ")" value
-            [[ -z "$value" ]] && { log_info "skipped $key"; continue; }
-            put_secret "$key" "$value"
-        fi
+        case "$(value_source "$key")" in
+            "$ENV_FILE_NAME")
+                [[ -n "${LOCAL_VALS[$key]+x}" ]] || { log_warn "skipped $key (not in $ENV_FILE_NAME)"; continue; }
+                put_secret "$key" "${LOCAL_VALS[$key]}" ;;
+            file)
+                put_secret "$key" "${FROM_VALS[$key]}" ;;
+            prompt)
+                local hint="new"
+                [[ -n "${REMOTE_IDS[$key]:-}" ]] && hint="Enter to keep current"
+                read -rp "$(echo -e "${CYAN}?${NC} $key ${DIM}($hint)${NC}: ")" value
+                [[ -z "$value" ]] && { log_info "skipped $key"; continue; }
+                put_secret "$key" "$value" ;;
+        esac
     done
+
+    shred_from_file
 }
 
 # ---------------------------------------------------------------- pull
