@@ -415,9 +415,15 @@ cmd_push() {
     # Bare push acts on drift only. For dev that's new + changed keys. For
     # staging/production we cannot see drift in values, so it's the keys BWS is
     # missing — an existing key is changed by naming it, never by Entering past it.
+    #
+    # --from narrows rather than widens: if a file is given, it IS the intent —
+    # push exactly its keys. Not every key it declares lives in .env (seed-only
+    # secrets, for one), and drift computed from .env would silently drop them.
     local keys=()
     if (( ${#KEYS_ARG[@]} )); then
         mapfile -t keys < <(printf '%s\n' "${KEYS_ARG[@]}")
+    elif [[ -n "$FROM_FILE" ]]; then
+        mapfile -t keys < <(printf '%s\n' "${!FROM_VALS[@]}" | sort)
     elif [[ "$ENV" == "dev" ]]; then
         mapfile -t keys < <(printf '%s\n' "${LOCAL_ONLY[@]:-}" "${CHANGED[@]:-}" | grep -v '^$' || true)
     else
@@ -427,10 +433,11 @@ cmd_push() {
     (( ${#keys[@]} )) || { log_success "Nothing to push — $ENV has every key in $ENV_FILE_NAME"; return 0; }
 
     # Where each value will come from, so the confirmation can say so per key.
+    # An explicit --from wins over .env, including for dev.
     value_source() {
-        if [[ "$ENV" == "dev" ]];              then echo "$ENV_FILE_NAME"
-        elif [[ -n "${FROM_VALS[$1]+x}" ]];    then echo "file"
-        else                                        echo "prompt"; fi
+        if   [[ -n "${FROM_VALS[$1]+x}" ]]; then echo "file"
+        elif [[ "$ENV" == "dev" ]];         then echo "$ENV_FILE_NAME"
+        else                                     echo "prompt"; fi
     }
 
     echo ""
