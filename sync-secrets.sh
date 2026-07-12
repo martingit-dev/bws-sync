@@ -1,489 +1,442 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Sync secrets to Bitwarden Secrets Manager
-# - Dev: reads from .env file
-# - Staging/Prod: prompts for each value (like gh secret set)
+# bws-sync — drift-first sync between .env and Bitwarden Secrets Manager
 #
-# Usage: ./sync-secrets.sh <repo_path>
+#   bws-sync                    status (default): show drift, read-only
+#   bws-sync init               write .bws-sync.toml with project IDs
+#   bws-sync push [KEY...]      push .env -> BWS (all keys, or just KEY...)
+#   bws-sync pull [KEY...]      pull BWS -> .env (dev only)
+#   bws-sync prune [KEY...]     delete BWS keys that aren't in .env
+#   bws-sync wire               rewrite .github/workflows/deploy-<env>.yml UUIDs
+#
+# Flags: -e/--env <dev|staging|production>  -d/--dir <path>  -y/--yes  -h/--help
+#
+# Values are only ever read from or written to .env for dev. For staging and
+# production the script compares keys only, and prompts for values.
 
-REPO_PATH="$1"
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; DIM=$'\033[2m'; NC=$'\033[0m'
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# Config file
-CONFIG_DIR="${BWS_SYNC_CONFIG_DIR:-$HOME/.config/bws-sync}"
-CONFIG_FILE="$CONFIG_DIR/secrets.conf"
-
-log_info() { echo -e "${BLUE}ℹ${NC} $1"; }
+log_info()    { echo -e "${BLUE}i${NC} $1"; }
 log_success() { echo -e "${GREEN}✓${NC} $1"; }
-log_warn() { echo -e "${YELLOW}!${NC} $1"; }
-log_error() { echo -e "${RED}✗${NC} $1"; }
-log_prompt() { echo -e "${CYAN}?${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
+log_error()   { echo -e "${RED}✗${NC} $1" >&2; }
 
-# Validate repo path
-if [[ -z "$REPO_PATH" ]]; then
-    echo "Usage: $0 <repo_path>"
-    echo ""
-    echo "Example:"
-    echo "  $0 /path/to/your/project"
-    exit 1
-fi
+die() { log_error "$1"; exit 1; }
 
-if [[ ! -d "$REPO_PATH" ]]; then
-    log_error "Repository not found: $REPO_PATH"
-    exit 1
-fi
-
-REPO_NAME=$(basename "$REPO_PATH")
-
-# Load config
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    log_error "Config file not found: $CONFIG_FILE"
-    echo ""
-    echo "Create it with your BWS access tokens:"
-    echo "  mkdir -p $CONFIG_DIR"
-    echo "  cat > $CONFIG_FILE << 'EOF'"
-    echo "BWS_ACCESS_TOKEN_DEV=\"your-dev-token\""
-    echo "BWS_ACCESS_TOKEN_STAGING=\"your-staging-token\""
-    echo "BWS_ACCESS_TOKEN_PRODUCTION=\"your-production-token\""
-    echo "EOF"
-    exit 1
-fi
-
-source "$CONFIG_FILE"
-
-# Get secret keys from .env (falls back to .env.local, then .env.example)
-get_secret_keys() {
-    local env_file="$REPO_PATH/.env"
-    local env_local="$REPO_PATH/.env.local"
-    local env_example="$REPO_PATH/.env.example"
-
-    local source_file=""
-    if [[ -f "$env_file" ]]; then
-        source_file="$env_file"
-    elif [[ -f "$env_local" ]]; then
-        source_file="$env_local"
-    elif [[ -f "$env_example" ]]; then
-        log_warn "No .env found — falling back to .env.example"
-        log_warn "Create a .env with real values, then push to BWS"
-        source_file="$env_example"
-    fi
-
-    if [[ -z "$source_file" ]]; then
-        return 1
-    fi
-
-    # Extract variable names
-    grep -E '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=' "$source_file" | \
-        sed 's/[[:space:]]*=.*//' | \
-        sed 's/^[[:space:]]*//' | \
-        grep -v '^#' | \
-        sort -u
+usage() {
+    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
 }
 
-# Parse .env file into associative array
-declare -A SECRETS
+# ---------------------------------------------------------------- args
 
-parse_env_file() {
-    local file="$1"
+CMD="status"
+ENV="dev"
+REPO_PATH="$PWD"
+ASSUME_YES="no"
+KEYS_ARG=()
 
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "${line// }" ]] && continue
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-
-        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-            local key="${BASH_REMATCH[1]}"
-            local value="${BASH_REMATCH[2]}"
-
-            value="${value%\"}"
-            value="${value#\"}"
-            value="${value%\'}"
-            value="${value#\'}"
-            value="${value%"${value##*[![:space:]]}"}"
-
-            SECRETS[$key]="$value"
-        fi
-    done < "$file"
-}
-
-echo ""
-log_info "Repository: $REPO_NAME"
-
-# Select action
-echo ""
-echo "Select action:"
-echo "  1) push dev        - Upload .env to BWS"
-echo "  2) push staging    - Enter values manually"
-echo "  3) push production - Enter values manually"
-echo "  4) pull dev        - Download secrets from BWS to .env"
-echo ""
-read -p "Choice [1-4]: " env_choice
-
-case $env_choice in
-    1) ENV="dev"; ACTION="push" ;;
-    2) ENV="staging"; ACTION="push" ;;
-    3) ENV="production"; ACTION="push" ;;
-    4) ENV="dev"; ACTION="pull" ;;
-    *) log_error "Invalid choice"; exit 1 ;;
+case "${1:-}" in
+    init|status|push|pull|prune|wire) CMD="$1"; shift ;;
+    -h|--help|help) usage 0 ;;
 esac
 
-# Get token
-ENV_UPPER=$(echo "$ENV" | tr '[:lower:]' '[:upper:]')
-ACCESS_TOKEN_VAR="BWS_ACCESS_TOKEN_${ENV_UPPER}"
-ACCESS_TOKEN="${!ACCESS_TOKEN_VAR}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -e|--env)  ENV="${2:-}"; shift 2 ;;
+        -d|--dir)  REPO_PATH="${2:-}"; shift 2 ;;
+        -y|--yes)  ASSUME_YES="yes"; shift ;;
+        -h|--help) usage 0 ;;
+        -*)        die "Unknown flag: $1" ;;
+        *)         KEYS_ARG+=("$1"); shift ;;
+    esac
+done
 
-if [[ -z "$ACCESS_TOKEN" ]]; then
-    log_error "$ACCESS_TOKEN_VAR not set in $CONFIG_FILE"
-    exit 1
-fi
+case "$ENV" in
+    dev|staging|production) ;;
+    prod) ENV="production" ;;
+    *) die "Invalid env: $ENV (dev|staging|production)" ;;
+esac
 
-# Prompt for project ID
-echo ""
-log_prompt "BWS Project ID for $ENV:"
-read -p "  Project ID: " PROJECT_ID
+[[ -d "$REPO_PATH" ]] || die "Not a directory: $REPO_PATH"
+REPO_PATH="$(cd "$REPO_PATH" && pwd)"
+REPO_NAME="$(basename "$REPO_PATH")"
 
-if [[ -z "$PROJECT_ID" ]]; then
-    log_error "Project ID required"
-    exit 1
-fi
+for bin in bws jq; do
+    command -v "$bin" >/dev/null || die "$bin not found on PATH"
+done
 
-# Validate project access
-log_info "Validating project access..."
-if ! bws project get "$PROJECT_ID" -t "$ACCESS_TOKEN" -o none 2>&1; then
-    log_error "Cannot access project. Check token and project ID."
-    exit 1
-fi
-log_success "Project access confirmed"
+confirm() {
+    [[ "$ASSUME_YES" == "yes" ]] && return 0
+    local reply
+    read -rp "$1 [y/N]: " reply
+    [[ "$reply" == "y" || "$reply" == "Y" ]]
+}
 
-# Get existing secrets
-log_info "Fetching existing secrets..."
-EXISTING=$(bws secret list "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json || echo "[]")
+# ---------------------------------------------------------------- config
 
-echo ""
+CONFIG_DIR="${BWS_SYNC_CONFIG_DIR:-$HOME/.config/bws-sync}"
+CONFIG_FILE="$CONFIG_DIR/secrets.conf"
+PROJECT_FILE="$REPO_PATH/.bws-sync.toml"
 
-# PULL MODE: Download secrets from BWS to .env
-if [[ "$ACTION" == "pull" ]]; then
-    SECRET_COUNT=$(echo "$EXISTING" | jq 'length')
+load_token() {
+    [[ -f "$CONFIG_FILE" ]] || die "No token config: $CONFIG_FILE (see README)"
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    local var="BWS_ACCESS_TOKEN_$(echo "$ENV" | tr '[:lower:]' '[:upper:]')"
+    ACCESS_TOKEN="${!var:-}"
+    [[ -n "$ACCESS_TOKEN" ]] || die "$var not set in $CONFIG_FILE"
+}
 
-    if [[ "$SECRET_COUNT" -eq 0 || "$SECRET_COUNT" == "null" ]]; then
-        log_error "No secrets found in this project"
-        exit 1
+# Reads `dev = "uuid"` under [projects], plus a top-level `env_file = "..."`.
+load_project() {
+    [[ -f "$PROJECT_FILE" ]] || die "No $PROJECT_FILE — run: bws-sync init"
+
+    ENV_FILE_NAME=$(awk -F'=' '/^[[:space:]]*env_file[[:space:]]*=/ {
+        gsub(/^[[:space:]]*"?|"?[[:space:]]*$/, "", $2); print $2; exit }' "$PROJECT_FILE")
+    ENV_FILE_NAME="${ENV_FILE_NAME:-.env}"
+
+    PROJECT_ID=$(awk -v want="$ENV" '
+        /^\[/ { section = $0 }
+        section == "[projects]" && $1 == want {
+            gsub(/^[^=]*=[[:space:]]*"?|"?[[:space:]]*$/, "", $0); print; exit }' "$PROJECT_FILE")
+
+    [[ -n "$PROJECT_ID" ]] || die "No project ID for '$ENV' in $PROJECT_FILE"
+    ENV_FILE="$REPO_PATH/$ENV_FILE_NAME"
+}
+
+cmd_init() {
+    if [[ -f "$PROJECT_FILE" ]]; then
+        log_warn "$PROJECT_FILE already exists"
+        confirm "  Overwrite?" || exit 0
     fi
 
-    log_info "Found $SECRET_COUNT secrets in BWS"
-
-    ENV_FILE="$REPO_PATH/.env"
-
-    # Show what will be written
     echo ""
-    echo "Secrets to write:"
-    echo "$EXISTING" | jq -r '.[].key' | sort | while read -r key; do
-        echo "  - $key"
+    log_info "Project IDs for $REPO_NAME (blank to skip an environment)"
+    local dev staging production env_file
+    read -rp "  dev:        " dev
+    read -rp "  staging:    " staging
+    read -rp "  production: " production
+    read -rp "  env file [.env]: " env_file
+
+    {
+        echo "# bws-sync — BWS project IDs for this repo."
+        echo "# Project IDs are not secrets; the access token lives in $CONFIG_DIR."
+        echo "env_file = \"${env_file:-.env}\""
+        echo ""
+        echo "[projects]"
+        [[ -n "$dev" ]]        && echo "dev = \"$dev\""
+        [[ -n "$staging" ]]    && echo "staging = \"$staging\""
+        [[ -n "$production" ]] && echo "production = \"$production\""
+    } > "$PROJECT_FILE"
+
+    log_success "Wrote $PROJECT_FILE — safe to commit"
+}
+
+# ---------------------------------------------------------------- state
+
+declare -A LOCAL_VALS=()   # key -> value from .env
+declare -A REMOTE_VALS=()  # key -> value from BWS
+declare -A REMOTE_IDS=()   # key -> BWS secret UUID
+
+parse_env_file() {
+    [[ -f "$ENV_FILE" ]] || return 1
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        key="${BASH_REMATCH[2]}"
+        value="${BASH_REMATCH[3]}"
+        value="${value%"${value##*[![:space:]]}"}"      # rstrip
+        if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+        LOCAL_VALS["$key"]="$value"
+    done < "$ENV_FILE"
+}
+
+fetch_remote() {
+    log_info "Fetching $ENV secrets from BWS…" >&2
+    local json
+    json=$(bws secret list "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json 2>/dev/null) \
+        || die "Cannot read project $PROJECT_ID — check token and project ID"
+
+    local key id value
+    while IFS=$'\t' read -r key id value; do
+        [[ -n "$key" ]] || continue
+        REMOTE_IDS["$key"]="$id"
+        REMOTE_VALS["$key"]="$value"
+    done < <(echo "$json" | jq -r '.[] | [.key, .id, .value] | @tsv')
+}
+
+# Populates SYNCED / LOCAL_ONLY / REMOTE_ONLY / CHANGED.
+# CHANGED is only computed for dev — staging/prod compare keys, never values.
+declare -a SYNCED=() LOCAL_ONLY=() REMOTE_ONLY=() CHANGED=()
+
+diff_state() {
+    SYNCED=(); LOCAL_ONLY=(); REMOTE_ONLY=(); CHANGED=()
+    local key
+    for key in "${!LOCAL_VALS[@]}"; do
+        if [[ -z "${REMOTE_IDS[$key]+x}" ]]; then
+            LOCAL_ONLY+=("$key")
+        elif [[ "$ENV" == "dev" && "${LOCAL_VALS[$key]}" != "${REMOTE_VALS[$key]}" ]]; then
+            CHANGED+=("$key")
+        else
+            SYNCED+=("$key")
+        fi
     done
-    echo ""
+    for key in "${!REMOTE_IDS[@]}"; do
+        [[ -z "${LOCAL_VALS[$key]+x}" ]] && REMOTE_ONLY+=("$key")
+    done
+    [[ ${#SYNCED[@]}      -gt 0 ]] && mapfile -t SYNCED      < <(printf '%s\n' "${SYNCED[@]}" | sort)
+    [[ ${#LOCAL_ONLY[@]}  -gt 0 ]] && mapfile -t LOCAL_ONLY  < <(printf '%s\n' "${LOCAL_ONLY[@]}" | sort)
+    [[ ${#REMOTE_ONLY[@]} -gt 0 ]] && mapfile -t REMOTE_ONLY < <(printf '%s\n' "${REMOTE_ONLY[@]}" | sort)
+    [[ ${#CHANGED[@]}     -gt 0 ]] && mapfile -t CHANGED     < <(printf '%s\n' "${CHANGED[@]}" | sort)
+    return 0
+}
 
-    if [[ -f "$ENV_FILE" ]]; then
-        log_warn ".env already exists — it will be overwritten"
+load_state() {
+    load_token
+    load_project
+    parse_env_file || log_warn "No $ENV_FILE_NAME in $REPO_NAME — comparing against BWS only"
+    fetch_remote
+    diff_state
+}
+
+# ---------------------------------------------------------------- status
+
+cmd_status() {
+    load_state
+
+    echo ""
+    echo -e "${DIM}$REPO_NAME · $ENV · $ENV_FILE_NAME${NC}"
+    printf '  %s%d in sync%s' "$GREEN" "${#SYNCED[@]}" "$NC"
+    printf '   %s+%d local-only%s' "$YELLOW" "${#LOCAL_ONLY[@]}" "$NC"
+    printf '   %s-%d bws-only%s' "$YELLOW" "${#REMOTE_ONLY[@]}" "$NC"
+    [[ "$ENV" == "dev" ]] && printf '   %s~%d changed%s' "$RED" "${#CHANGED[@]}" "$NC"
+    echo -e "\n"
+
+    (( ${#LOCAL_ONLY[@]} ))  && printf "  ${YELLOW}+${NC} %s ${DIM}(in %s, not in BWS)${NC}\n" "$(join_keys "${LOCAL_ONLY[@]}")" "$ENV_FILE_NAME"
+    (( ${#REMOTE_ONLY[@]} )) && printf "  ${YELLOW}-${NC} %s ${DIM}(in BWS, not in %s)${NC}\n" "$(join_keys "${REMOTE_ONLY[@]}")" "$ENV_FILE_NAME"
+    (( ${#CHANGED[@]} ))     && printf "  ${RED}~${NC} %s ${DIM}(values differ)${NC}\n" "$(join_keys "${CHANGED[@]}")"
+
+    if (( ${#LOCAL_ONLY[@]} + ${#REMOTE_ONLY[@]} + ${#CHANGED[@]} == 0 )); then
+        log_success "No drift"
+        return 0
+    fi
+
+    echo ""
+    if [[ "$ENV" == "dev" ]]; then
+        echo -e "  ${DIM}bws-sync push [KEY…]   ·   bws-sync pull [KEY…]   ·   bws-sync prune${NC}"
     else
-        log_info ".env will be created"
+        echo -e "  ${DIM}keys only — $ENV values are never read into $ENV_FILE_NAME${NC}"
+        echo -e "  ${DIM}bws-sync push -e $ENV [KEY…]   ·   bws-sync prune -e $ENV   ·   bws-sync wire -e $ENV${NC}"
     fi
-
-    read -p "Continue? [y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 0
-
-    # Write .env file
-    echo "# Generated from Bitwarden Secrets Manager" > "$ENV_FILE"
-    echo "# Project: $PROJECT_ID | Environment: $ENV" >> "$ENV_FILE"
-    echo "# Pulled: $(date -Iseconds)" >> "$ENV_FILE"
-    echo "" >> "$ENV_FILE"
-
-    echo "$EXISTING" | jq -r '.[] | .key + "=" + .value' | sort >> "$ENV_FILE"
-
-    log_success "Written to: $ENV_FILE"
-
     echo ""
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}  Pull complete${NC}"
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo "Make sure .env is in your .gitignore!"
-    exit 0
-fi
+    return 1
+}
 
-# PUSH MODE
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  Pushing to: $ENV${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
+join_keys() { printf '%s' "$1"; shift; printf ', %s' "$@"; echo; }
 
-# Track UUIDs
-declare -A UUID_MAP
-
-if [[ "$ENV" == "dev" ]]; then
-    # DEV: Read from .env file
-    ENV_FILE="$REPO_PATH/.env"
-    if [[ ! -f "$ENV_FILE" ]]; then
-        ENV_FILE="$REPO_PATH/.env.local"
-    fi
-
-    if [[ ! -f "$ENV_FILE" ]]; then
-        if [[ -f "$REPO_PATH/.env.example" ]]; then
-            log_error "No .env found. Copy .env.example and fill in real values:"
-            echo "  cp $REPO_PATH/.env.example $REPO_PATH/.env"
-        else
-            log_error "No .env found. Create one with your secret values first."
-        fi
-        exit 1
-    fi
-
-    log_info "Reading from: $ENV_FILE"
-    parse_env_file "$ENV_FILE"
-
-    echo ""
-    echo "Variables to sync:"
-    for key in $(echo "${!SECRETS[@]}" | tr ' ' '\n' | sort); do
-        echo "  - $key"
-    done
-    echo ""
-    read -p "Continue? [y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 0
-
-    # Sync each secret
-    for KEY in "${!SECRETS[@]}"; do
-        VALUE="${SECRETS[$KEY]}"
-        EXISTING_ID=$(echo "$EXISTING" | jq -r ".[] | select(.key == \"$KEY\") | .id" 2>/dev/null || echo "")
-
-        if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
-            log_info "Updating: $KEY"
-            if ! bws secret edit --value "$VALUE" "$EXISTING_ID" -t "$ACCESS_TOKEN" -o none; then
-                log_error "Failed to update $KEY"
-                continue
-            fi
-            UUID_MAP[$KEY]="$EXISTING_ID"
-        else
-            log_info "Creating: $KEY"
-            if ! RESULT=$(bws secret create "$KEY" "$VALUE" "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json); then
-                log_error "Failed to create $KEY"
-                continue
-            fi
-            SECRET_ID=$(echo "$RESULT" | jq -r '.id')
-            UUID_MAP[$KEY]="$SECRET_ID"
-        fi
-    done
-
-    log_success "Dev sync complete"
-
-else
-    # STAGING/PROD: Prompt for each value
-
-    # Get list of keys from .env or existing BWS secrets
-    KEYS=()
-
-    if keys_from_env=$(get_secret_keys); then
-        while IFS= read -r key; do
-            KEYS+=("$key")
-        done <<< "$keys_from_env"
-        log_info "Using keys from .env"
+# Keys to act on: explicit args, else the drift set passed in.
+select_keys() {
+    if (( ${#KEYS_ARG[@]} )); then
+        printf '%s\n' "${KEYS_ARG[@]}"
     else
-        # Fall back to existing secrets in BWS
-        while IFS= read -r key; do
-            [[ -n "$key" ]] && KEYS+=("$key")
-        done <<< "$(echo "$EXISTING" | jq -r '.[].key' 2>/dev/null)"
-        log_info "Using keys from existing BWS secrets"
+        printf '%s\n' "$@"
     fi
+}
 
-    if [[ ${#KEYS[@]} -eq 0 ]]; then
-        log_error "No keys found. Create a .env file first."
-        exit 1
-    fi
+# ---------------------------------------------------------------- push
 
-    echo ""
-    echo "Enter values for each secret (press Enter to skip, existing value kept):"
-    echo ""
-
-    for KEY in "${KEYS[@]}"; do
-        # Get existing value (masked)
-        EXISTING_ID=$(echo "$EXISTING" | jq -r ".[] | select(.key == \"$KEY\") | .id" 2>/dev/null || echo "")
-
-        if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
-            echo -e "${CYAN}?${NC} $KEY ${YELLOW}(has existing value)${NC}"
+put_secret() {
+    local key="$1" value="$2"
+    if [[ -n "${REMOTE_IDS[$key]:-}" ]]; then
+        bws secret edit --value "$value" "${REMOTE_IDS[$key]}" -t "$ACCESS_TOKEN" -o none \
+            && log_success "updated $key" || log_error "failed to update $key"
+    else
+        local result
+        if result=$(bws secret create "$key" "$value" "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json); then
+            REMOTE_IDS["$key"]=$(echo "$result" | jq -r '.id')
+            log_success "created $key"
         else
-            echo -e "${CYAN}?${NC} $KEY ${YELLOW}(new)${NC}"
+            log_error "failed to create $key"
         fi
+    fi
+}
 
-        read -p "  Value: " VALUE
+cmd_push() {
+    load_state
 
-        if [[ -z "$VALUE" ]]; then
-            if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
-                log_info "Keeping existing: $KEY"
-                UUID_MAP[$KEY]="$EXISTING_ID"
+    local keys=()
+    mapfile -t keys < <(select_keys "${LOCAL_ONLY[@]:-}" "${CHANGED[@]:-}" | grep -v '^$' || true)
+
+    # staging/prod: nothing local to diff against means push whatever the user named,
+    # or every key .env declares (values are prompted, not read).
+    if [[ "$ENV" != "dev" ]] && ! (( ${#KEYS_ARG[@]} )); then
+        mapfile -t keys < <(printf '%s\n' "${!LOCAL_VALS[@]}" "${!REMOTE_IDS[@]}" | sort -u)
+    fi
+
+    (( ${#keys[@]} )) || { log_success "Nothing to push"; return 0; }
+
+    echo ""
+    echo "Push to $ENV ($REPO_NAME):"
+    printf '  %s\n' "${keys[@]}"
+    echo ""
+    confirm "Continue?" || exit 0
+    echo ""
+
+    local key value
+    for key in "${keys[@]}"; do
+        if [[ "$ENV" == "dev" ]]; then
+            [[ -n "${LOCAL_VALS[$key]+x}" ]] || { log_warn "skipped $key (not in $ENV_FILE_NAME)"; continue; }
+            put_secret "$key" "${LOCAL_VALS[$key]}"
+        else
+            local hint="new"
+            [[ -n "${REMOTE_IDS[$key]:-}" ]] && hint="has existing value — Enter to keep"
+            read -rp "$(echo -e "${CYAN}?${NC} $key ${DIM}($hint)${NC}: ")" value
+            [[ -z "$value" ]] && { log_info "kept $key"; continue; }
+            put_secret "$key" "$value"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------- pull
+
+cmd_pull() {
+    [[ "$ENV" == "dev" ]] || die "pull is dev-only — staging/production values must not land in $ENV_FILE_NAME"
+    load_state
+
+    (( ${#REMOTE_IDS[@]} )) || die "No secrets in BWS project $PROJECT_ID"
+
+    local keys=()
+    mapfile -t keys < <(select_keys "${!REMOTE_IDS[@]}" | sort)
+
+    if (( ${#KEYS_ARG[@]} )); then
+        # Surgical: rewrite just these keys in place, leave the rest of .env alone.
+        local key
+        for key in "${keys[@]}"; do
+            [[ -n "${REMOTE_IDS[$key]:-}" ]] || { log_warn "skipped $key (not in BWS)"; continue; }
+            local escaped="${REMOTE_VALS[$key]//\\/\\\\}"; escaped="${escaped//&/\\&}"
+            if grep -qE "^[[:space:]]*(export[[:space:]]+)?$key[[:space:]]*=" "$ENV_FILE" 2>/dev/null; then
+                sed -i -E "s|^([[:space:]]*(export[[:space:]]+)?$key[[:space:]]*=).*|\1$escaped|" "$ENV_FILE"
+                log_success "updated $key in $ENV_FILE_NAME"
             else
-                log_warn "Skipping: $KEY (no value)"
+                echo "$key=${REMOTE_VALS[$key]}" >> "$ENV_FILE"
+                log_success "appended $key to $ENV_FILE_NAME"
             fi
-            continue
-        fi
-
-        if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
-            log_info "Updating: $KEY"
-            if ! bws secret edit --value "$VALUE" "$EXISTING_ID" -t "$ACCESS_TOKEN" -o none; then
-                log_error "Failed to update $KEY"
-                continue
-            fi
-            UUID_MAP[$KEY]="$EXISTING_ID"
-        else
-            log_info "Creating: $KEY"
-            if ! RESULT=$(bws secret create "$KEY" "$VALUE" "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json); then
-                log_error "Failed to create $KEY"
-                continue
-            fi
-            SECRET_ID=$(echo "$RESULT" | jq -r '.id')
-            UUID_MAP[$KEY]="$SECRET_ID"
-        fi
-    done
-
-    log_success "Secrets synced for $ENV"
-
-    # Update workflow file
-    WORKFLOW_FILE="$REPO_PATH/.github/workflows/deploy-${ENV}.yml"
-
-    if [[ -f "$WORKFLOW_FILE" ]]; then
-        log_info "Updating workflow: deploy-${ENV}.yml"
-
-        # Build secrets block
-        SECRETS_LINES=""
-        for KEY in $(echo "${!UUID_MAP[@]}" | tr ' ' '\n' | sort); do
-            UUID="${UUID_MAP[$KEY]}"
-            SECRETS_LINES+="            ${UUID} > ${KEY}"$'\n'
         done
-        SECRETS_LINES="${SECRETS_LINES%$'\n'}"
+        return 0
+    fi
 
-        # Replace secrets block
-        TEMP_FILE=$(mktemp)
+    echo ""
+    echo "Pull $ENV -> $ENV_FILE_NAME (${#keys[@]} secrets):"
+    (( ${#CHANGED[@]} ))     && printf "  ${RED}~${NC} %s ${DIM}(local value will be replaced)${NC}\n" "$(join_keys "${CHANGED[@]}")"
+    (( ${#LOCAL_ONLY[@]} ))  && printf "  ${RED}!${NC} %s ${DIM}(local-only — will be LOST)${NC}\n" "$(join_keys "${LOCAL_ONLY[@]}")"
+    (( ${#REMOTE_ONLY[@]} )) && printf "  ${GREEN}+${NC} %s ${DIM}(new)${NC}\n" "$(join_keys "${REMOTE_ONLY[@]}")"
+    echo ""
+    [[ -f "$ENV_FILE" ]] && log_warn "$ENV_FILE_NAME will be overwritten (backup: $ENV_FILE_NAME.bak)"
+    confirm "Continue?" || exit 0
 
-        awk -v new_secrets="$SECRETS_LINES" '
-        BEGIN { in_secrets = 0; printed = 0 }
-        /secrets: \|/ {
-            print
-            in_secrets = 1
-            next
-        }
+    [[ -f "$ENV_FILE" ]] && cp "$ENV_FILE" "$ENV_FILE.bak"
+
+    {
+        echo "# Pulled from Bitwarden Secrets Manager — $(date -Iseconds)"
+        echo "# Project: $PROJECT_ID | Environment: $ENV"
+        echo ""
+        local key
+        for key in "${keys[@]}"; do
+            echo "$key=${REMOTE_VALS[$key]}"
+        done
+    } > "$ENV_FILE"
+
+    log_success "Wrote $ENV_FILE_NAME — make sure it's gitignored"
+}
+
+# ---------------------------------------------------------------- prune
+
+cmd_prune() {
+    load_state
+
+    local keys=()
+    mapfile -t keys < <(select_keys "${REMOTE_ONLY[@]:-}" | grep -v '^$' || true)
+    (( ${#keys[@]} )) || { log_success "Nothing to prune"; return 0; }
+
+    echo ""
+    log_warn "Delete from BWS $ENV — permanent:"
+    printf '  %s\n' "${keys[@]}"
+    echo ""
+    confirm "Delete?" || exit 0
+
+    local key
+    for key in "${keys[@]}"; do
+        [[ -n "${REMOTE_IDS[$key]:-}" ]] || { log_warn "skipped $key (not in BWS)"; continue; }
+        bws secret delete "${REMOTE_IDS[$key]}" -t "$ACCESS_TOKEN" -o none \
+            && log_success "deleted $key" || log_error "failed to delete $key"
+    done
+}
+
+# ---------------------------------------------------------------- wire
+
+cmd_wire() {
+    load_state
+
+    local workflow="$REPO_PATH/.github/workflows/deploy-${ENV}.yml"
+    [[ -f "$workflow" ]] || die "No workflow: .github/workflows/deploy-${ENV}.yml"
+    (( ${#REMOTE_IDS[@]} )) || die "No secrets in BWS project $PROJECT_ID"
+
+    local lines="" key
+    for key in $(printf '%s\n' "${!REMOTE_IDS[@]}" | sort); do
+        lines+="            ${REMOTE_IDS[$key]} > ${key}"$'\n'
+    done
+    lines="${lines%$'\n'}"
+
+    local tmp
+    tmp=$(mktemp)
+    awk -v new_secrets="$lines" '
+        /secrets: \|/ { print; in_secrets = 1; printed = 0; next }
         in_secrets {
             if (/^[[:space:]]+[a-f0-9-]+ >/ || /^[[:space:]]+[a-f0-9]+-xxxx/) {
-                if (!printed) {
-                    print new_secrets
-                    printed = 1
-                }
+                if (!printed) { print new_secrets; printed = 1 }
                 next
-            } else {
-                in_secrets = 0
-                printed = 0
             }
+            in_secrets = 0
         }
         { print }
-        ' "$WORKFLOW_FILE" > "$TEMP_FILE"
+    ' "$workflow" > "$tmp"
+    mv "$tmp" "$workflow"
 
-        mv "$TEMP_FILE" "$WORKFLOW_FILE"
-        log_success "Workflow updated"
-    else
-        log_warn "Workflow not found: $WORKFLOW_FILE"
+    log_success "Wired ${#REMOTE_IDS[@]} UUIDs into deploy-${ENV}.yml"
+
+    local gh_repo
+    gh_repo=$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null \
+        | sed -E 's#.*github\.com[:/]([^/]+/[^/]+?)(\.git)?$#\1#') || true
+    [[ -n "$gh_repo" ]] || return 0
+    command -v gh >/dev/null || return 0
+
+    if ! gh api "repos/$gh_repo/environments/$ENV" &>/dev/null; then
+        confirm "GitHub environment '$ENV' missing — create it?" || return 0
+        gh api --method PUT "repos/$gh_repo/environments/$ENV" &>/dev/null \
+            && log_success "created environment $ENV" || { log_error "failed to create environment"; return 0; }
     fi
 
-    # Configure GitHub
-    GITHUB_REPO=""
-    if [[ -d "$REPO_PATH/.git" ]]; then
-        GITHUB_REPO=$(cd "$REPO_PATH" && git remote get-url origin 2>/dev/null | sed 's/.*github.com[:/]\(.*\)\.git/\1/' | sed 's/.*github.com[:/]\(.*\)/\1/')
+    if gh secret list --repo "$gh_repo" --env "$ENV" 2>/dev/null | grep -q '^BWS_ACCESS_TOKEN'; then
+        log_success "BWS_ACCESS_TOKEN already set on $ENV"
+    elif confirm "Set BWS_ACCESS_TOKEN on GitHub environment '$ENV'?"; then
+        echo "$ACCESS_TOKEN" | gh secret set BWS_ACCESS_TOKEN --repo "$gh_repo" --env "$ENV" \
+            && log_success "BWS_ACCESS_TOKEN configured"
     fi
+}
 
-    if [[ -z "$GITHUB_REPO" ]]; then
-        read -p "GitHub repo (owner/name): " GITHUB_REPO
-    fi
+# ---------------------------------------------------------------- dispatch
 
-    log_info "Checking GitHub environment..."
-
-    # Check if environment exists
-    if gh api "repos/$GITHUB_REPO/environments/$ENV" &>/dev/null; then
-        log_success "Environment '$ENV' exists"
-        ENV_READY="yes"
-    else
-        log_warn "Environment '$ENV' does not exist"
-        read -p "  Create it? [y/N]: " create_env
-
-        if [[ "$create_env" == "y" || "$create_env" == "Y" ]]; then
-            if gh api --method PUT "repos/$GITHUB_REPO/environments/$ENV" &>/dev/null; then
-                log_success "Environment created"
-                ENV_READY="yes"
-            else
-                log_error "Failed to create environment"
-                ENV_READY="no"
-            fi
-        else
-            ENV_READY="no"
-        fi
-    fi
-
-    if [[ "$ENV_READY" == "yes" ]]; then
-        # List all secrets in environment
-        ALL_SECRETS=$(gh secret list --repo "$GITHUB_REPO" --env "$ENV" 2>/dev/null | awk '{print $1}' || echo "")
-
-        # Check for secrets that aren't BWS_ACCESS_TOKEN
-        OTHER_SECRETS=""
-        HAS_BWS_TOKEN="no"
-        while IFS= read -r secret; do
-            [[ -z "$secret" ]] && continue
-            if [[ "$secret" == "BWS_ACCESS_TOKEN" ]]; then
-                HAS_BWS_TOKEN="yes"
-            else
-                OTHER_SECRETS+="$secret "
-            fi
-        done <<< "$ALL_SECRETS"
-
-        # Offer to delete other secrets
-        if [[ -n "${OTHER_SECRETS// }" ]]; then
-            log_warn "Found other secrets: $OTHER_SECRETS"
-            read -p "  Delete them? (Only BWS_ACCESS_TOKEN needed) [y/N]: " delete_others
-
-            if [[ "$delete_others" == "y" || "$delete_others" == "Y" ]]; then
-                for secret in $OTHER_SECRETS; do
-                    gh secret delete "$secret" --repo "$GITHUB_REPO" --env "$ENV" 2>/dev/null
-                    log_info "Deleted: $secret"
-                done
-            fi
-        fi
-
-        # Set BWS_ACCESS_TOKEN if missing
-        if [[ "$HAS_BWS_TOKEN" == "no" ]]; then
-            log_warn "BWS_ACCESS_TOKEN not set"
-            read -p "  Set it now? [y/N]: " set_token
-
-            if [[ "$set_token" == "y" || "$set_token" == "Y" ]]; then
-                if echo "$ACCESS_TOKEN" | gh secret set BWS_ACCESS_TOKEN --repo "$GITHUB_REPO" --env "$ENV"; then
-                    log_success "BWS_ACCESS_TOKEN configured"
-                else
-                    log_error "Failed to set BWS_ACCESS_TOKEN"
-                fi
-            fi
-        else
-            log_success "BWS_ACCESS_TOKEN already configured"
-        fi
-    fi
-fi
-
-echo ""
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  Complete${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
-
-if [[ "$ENV" != "dev" ]]; then
-    echo "Next steps:"
-    echo "  1. Review changes: git diff"
-    echo "  2. Commit: git add -A && git commit -m 'chore: update BWS secret UUIDs'"
-    echo "  3. Push: git push"
-fi
+case "$CMD" in
+    init)   cmd_init ;;
+    status) cmd_status ;;
+    push)   cmd_push ;;
+    pull)   cmd_pull ;;
+    prune)  cmd_prune ;;
+    wire)   cmd_wire ;;
+esac
