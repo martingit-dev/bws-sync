@@ -1,0 +1,8 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.bak
+
+# bws-sync access tokens, if anyone keeps them locally instead of ~/.config
+secrets.conf

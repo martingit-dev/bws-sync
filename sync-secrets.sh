@@ -387,6 +387,25 @@ cmd_push() {
 
 # ---------------------------------------------------------------- pull
 
+# pull writes plaintext secrets to disk. Refuse to do that silently if git
+# would track them. Only warns when the target is actually a git repo.
+warn_if_tracked() {
+    git -C "$REPO_PATH" rev-parse --git-dir &>/dev/null || return 0
+
+    local exposed=() f
+    for f in "$ENV_FILE_NAME" "$ENV_FILE_NAME.bak"; do
+        git -C "$REPO_PATH" check-ignore -q "$f" 2>/dev/null || exposed+=("$f")
+    done
+    (( ${#exposed[@]} )) || return 0
+
+    echo ""
+    log_warn "git is not ignoring: $(join_keys "${exposed[@]}")"
+    log_warn "pull writes plaintext secrets there — add to .gitignore first:"
+    printf '    %s\n' "${exposed[@]}"
+    echo ""
+    confirm "  Continue anyway?" || exit 1
+}
+
 # Rewrite one KEY= line in place, preserving everything else. Done in bash
 # rather than sed so that secret values are never parsed as pattern syntax.
 replace_env_line() {
@@ -417,6 +436,8 @@ cmd_pull() {
     load_state
 
     (( ${#REMOTE_IDS[@]} )) || die "No secrets in BWS project $PROJECT_ID"
+
+    warn_if_tracked
 
     local keys=()
     mapfile -t keys < <(select_keys "${!REMOTE_IDS[@]}" | sort)
@@ -452,7 +473,7 @@ cmd_pull() {
         done
     } > "$ENV_FILE"
 
-    log_success "Wrote $ENV_FILE_NAME — make sure it's gitignored"
+    log_success "Wrote $ENV_FILE_NAME (${#keys[@]} secrets)"
 }
 
 # ---------------------------------------------------------------- prune
