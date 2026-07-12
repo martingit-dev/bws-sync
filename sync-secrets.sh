@@ -1,22 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# bws-sync — drift-first sync between .env and Bitwarden Secrets Manager
-#
-#   bws-sync                    status (default): show drift, read-only
-#   bws-sync init               write .bws-sync.toml with project IDs
-#   bws-sync push [KEY...]      push .env -> BWS (all keys, or just KEY...)
-#   bws-sync pull [KEY...]      pull BWS -> .env (dev only)
-#   bws-sync prune [KEY...]     delete BWS keys that aren't in .env
-#   bws-sync wire               rewrite .github/workflows/deploy-<env>.yml UUIDs
-#
-# Flags: -e/--env <dev|staging|production>  -d/--dir <path>  -y/--yes  -h/--help
-#
-# Values are only ever read from or written to .env for dev. For staging and
-# production the script compares keys only, and prompts for values.
+# bws-sync — drift-first sync between .env and Bitwarden Secrets Manager.
+# Run inside a project. See --help.
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
-BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; DIM=$'\033[2m'; NC=$'\033[0m'
+BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; DIM=$'\033[2m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 
 log_info()    { echo -e "${BLUE}i${NC} $1"; }
 log_success() { echo -e "${GREEN}✓${NC} $1"; }
@@ -25,8 +14,77 @@ log_error()   { echo -e "${RED}✗${NC} $1" >&2; }
 
 die() { log_error "$1"; exit 1; }
 
+CONFIG_DIR="${BWS_SYNC_CONFIG_DIR:-$HOME/.config/bws-sync}"
+CONFIG_FILE="$CONFIG_DIR/secrets.conf"
+
 usage() {
-    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+    cat <<EOF
+${BOLD}bws-sync${NC} — keep .env and Bitwarden Secrets Manager in agreement.
+Runs against the current directory.
+
+${BOLD}USAGE${NC}
+  bws-sync [command] [KEY...] [flags]
+
+${BOLD}COMMANDS${NC}
+  ${BOLD}(none)${NC}          Status. Show drift between .env and BWS. Read-only, no
+                  prompts, exits 1 if anything differs.
+  ${BOLD}init${NC}            Write .bws-sync.toml — this repo's BWS project IDs, one per
+                  environment. Run once per project. Safe to commit.
+  ${BOLD}push${NC} [KEY...]   Send values to BWS. No KEY = every key that is new or
+                  changed. Named KEYs = only those.
+  ${BOLD}pull${NC} [KEY...]   Bring values into .env. No KEY = rewrite the file (backs up
+                  to .env.bak). Named KEYs = replace only those lines. Dev only.
+  ${BOLD}prune${NC} [KEY...]  Delete BWS secrets that no longer exist in .env. Permanent.
+  ${BOLD}wire${NC}            Rewrite .github/workflows/deploy-<env>.yml with the current
+                  'UUID > KEY' block, and set BWS_ACCESS_TOKEN on the GitHub
+                  environment. Produces a repo diff you commit.
+
+${BOLD}FLAGS${NC}
+  -e, --env <dev|staging|production>   Which environment. Default: dev.
+  -d, --dir <path>                     Which project. Default: current directory.
+  -y, --yes                            Skip confirmations.
+  -h, --help                           This.
+
+${BOLD}ALL vs ONE${NC}
+  Bare command acts on everything; naming keys narrows it. There is no -a flag
+  because the bare command already is one.
+
+    bws-sync                       # what's out of sync in dev?
+    bws-sync push                  # push every drifted dev key
+    bws-sync push STRIPE_KEY       # push only that one
+    bws-sync pull DATABASE_URL     # pull only that one, rest of .env untouched
+
+${BOLD}ENVIRONMENTS${NC}
+  Environments share their ${BOLD}keys${NC}, never their ${BOLD}values${NC}. Nothing is ever copied
+  from dev into staging or production.
+
+  dev         Values live in .env. Push reads it, pull writes it, status
+              compares keys AND values.
+  staging     Values live only in BWS. Push ${BOLD}prompts${NC} you for each one (Enter
+  production  keeps what BWS already has). Status compares keys only — these
+              values are never written to .env or printed. Pull is refused.
+
+${BOLD}SETTING UP A NEW ENVIRONMENT${NC}
+  Say production, on a project that already has dev working:
+
+    1. In the Bitwarden web vault: create the project, create a machine account,
+       grant it access, issue an access token. (No CLI or API exists for this.)
+    2. Add the token to \$BWS_SYNC_CONFIG_DIR/secrets.conf as
+       BWS_ACCESS_TOKEN_PRODUCTION.
+    3. bws-sync init          — add the production project ID.
+    4. bws-sync push -e production
+         Takes the key list from .env, then prompts for each production value.
+         Your dev values are not used. Press Enter to skip a key that doesn't
+         apply to production.
+    5. bws-sync wire -e production   — point the workflow at the new UUIDs.
+
+${BOLD}FILES${NC}
+  .bws-sync.toml   Project UUIDs. Not secret — commit it.
+  .env             Real dev values. Gitignore it.
+  \$BWS_SYNC_CONFIG_DIR/secrets.conf
+                   Access tokens, one per environment. Never in a repo.
+                   Currently: $CONFIG_DIR
+EOF
     exit "${1:-0}"
 }
 
@@ -77,8 +135,6 @@ confirm() {
 
 # ---------------------------------------------------------------- config
 
-CONFIG_DIR="${BWS_SYNC_CONFIG_DIR:-$HOME/.config/bws-sync}"
-CONFIG_FILE="$CONFIG_DIR/secrets.conf"
 PROJECT_FILE="$REPO_PATH/.bws-sync.toml"
 
 load_token() {
@@ -90,40 +146,66 @@ load_token() {
     [[ -n "$ACCESS_TOKEN" ]] || die "$var not set in $CONFIG_FILE"
 }
 
-# Reads `dev = "uuid"` under [projects], plus a top-level `env_file = "..."`.
 load_project() {
-    [[ -f "$PROJECT_FILE" ]] || die "No $PROJECT_FILE — run: bws-sync init"
+    [[ -f "$PROJECT_FILE" ]] || die "No .bws-sync.toml in $REPO_NAME — run: bws-sync init"
 
-    ENV_FILE_NAME=$(awk -F'=' '/^[[:space:]]*env_file[[:space:]]*=/ {
-        gsub(/^[[:space:]]*"?|"?[[:space:]]*$/, "", $2); print $2; exit }' "$PROJECT_FILE")
+    ENV_FILE_NAME=$(read_toml env_file)
     ENV_FILE_NAME="${ENV_FILE_NAME:-.env}"
-
-    PROJECT_ID=$(awk -v want="$ENV" '
-        /^\[/ { section = $0 }
-        section == "[projects]" && $1 == want {
-            gsub(/^[^=]*=[[:space:]]*"?|"?[[:space:]]*$/, "", $0); print; exit }' "$PROJECT_FILE")
-
-    [[ -n "$PROJECT_ID" ]] || die "No project ID for '$ENV' in $PROJECT_FILE"
     ENV_FILE="$REPO_PATH/$ENV_FILE_NAME"
+
+    PROJECT_ID=$(read_toml "$ENV" projects)
+    [[ -n "$PROJECT_ID" ]] || die "No '$ENV' project ID in .bws-sync.toml — run: bws-sync init"
+}
+
+# Reads one `key = "value"` out of .bws-sync.toml. Section-aware for [projects].
+read_toml() {
+    local want="$1" section="${2:-}"
+    [[ -f "$PROJECT_FILE" ]] || return 0
+    awk -v want="$want" -v want_sec="$section" '
+        /^[[:space:]]*\[/ { sec = $0; gsub(/[][[:space:]]/, "", sec); next }
+        $1 == want && sec == want_sec {
+            sub(/^[^=]*=[[:space:]]*/, "", $0)
+            gsub(/^"|"[[:space:]]*$/, "", $0)
+            print; exit
+        }' "$PROJECT_FILE"
+}
+
+# Prompt with the current value as the default — so re-running init to add one
+# environment doesn't silently drop the others.
+ask_with_default() {
+    local label="$1" current="$2" reply
+    if [[ -n "$current" ]]; then
+        read -rp "  $label [$current]: " reply
+        echo "${reply:-$current}"
+    else
+        read -rp "  $label: " reply
+        echo "$reply"
+    fi
 }
 
 cmd_init() {
-    if [[ -f "$PROJECT_FILE" ]]; then
-        log_warn "$PROJECT_FILE already exists"
-        confirm "  Overwrite?" || exit 0
-    fi
+    local dev staging production env_file
+    dev=$(read_toml dev projects)
+    staging=$(read_toml staging projects)
+    production=$(read_toml production projects)
+    env_file=$(read_toml env_file)
 
     echo ""
-    log_info "Project IDs for $REPO_NAME (blank to skip an environment)"
-    local dev staging production env_file
-    read -rp "  dev:        " dev
-    read -rp "  staging:    " staging
-    read -rp "  production: " production
-    read -rp "  env file [.env]: " env_file
+    if [[ -f "$PROJECT_FILE" ]]; then
+        log_info "Updating .bws-sync.toml for $REPO_NAME (Enter keeps the current value)"
+    else
+        log_info "Project IDs for $REPO_NAME (blank to skip an environment)"
+    fi
+
+    dev=$(ask_with_default "dev:       " "$dev")
+    staging=$(ask_with_default "staging:   " "$staging")
+    production=$(ask_with_default "production:" "$production")
+    env_file=$(ask_with_default "env file:  " "${env_file:-.env}")
 
     {
         echo "# bws-sync — BWS project IDs for this repo."
-        echo "# Project IDs are not secrets; the access token lives in $CONFIG_DIR."
+        echo "# Project IDs are not secrets: they are inert without an access token,"
+        echo "# and tokens live only in $CONFIG_DIR. Safe to commit."
         echo "env_file = \"${env_file:-.env}\""
         echo ""
         echo "[projects]"
