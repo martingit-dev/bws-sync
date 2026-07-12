@@ -241,9 +241,24 @@ parse_env_file() {
 
 fetch_remote() {
     log_info "Fetching $ENV secrets from BWS…" >&2
-    local json
-    json=$(bws secret list "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json 2>/dev/null) \
-        || die "Cannot read project $PROJECT_ID — check token and project ID"
+
+    local json err
+    err=$(mktemp)
+    if ! json=$(bws secret list "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json 2>"$err"); then
+        # bws returns 404 for a project that exists but holds no secrets. That is
+        # the normal state of a project you are about to provision, not an error —
+        # so ask the project endpoint whether the token can actually see it.
+        if bws project get "$PROJECT_ID" -t "$ACCESS_TOKEN" -o none &>/dev/null; then
+            rm -f "$err"
+            log_info "Project is empty — no secrets in BWS yet" >&2
+            return 0
+        fi
+        log_error "Cannot read project $PROJECT_ID in $ENV"
+        log_error "$(head -3 "$err" | tr -d '\n')"
+        rm -f "$err"
+        exit 1
+    fi
+    rm -f "$err"
 
     local key id value
     while IFS=$'\t' read -r key id value; do
