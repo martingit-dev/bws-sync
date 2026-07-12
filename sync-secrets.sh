@@ -367,34 +367,49 @@ put_secret() {
 cmd_push() {
     load_state
 
+    # Bare push acts on drift only. For dev that's new + changed keys. For
+    # staging/production we cannot see drift in values, so it's the keys BWS is
+    # missing — an existing key is changed by naming it, never by Entering past it.
     local keys=()
-    mapfile -t keys < <(select_keys "${LOCAL_ONLY[@]:-}" "${CHANGED[@]:-}" | grep -v '^$' || true)
-
-    # staging/prod: nothing local to diff against means push whatever the user named,
-    # or every key .env declares (values are prompted, not read).
-    if [[ "$ENV" != "dev" ]] && ! (( ${#KEYS_ARG[@]} )); then
-        mapfile -t keys < <(printf '%s\n' "${!LOCAL_VALS[@]}" "${!REMOTE_IDS[@]}" | sort -u)
+    if (( ${#KEYS_ARG[@]} )); then
+        mapfile -t keys < <(printf '%s\n' "${KEYS_ARG[@]}")
+    elif [[ "$ENV" == "dev" ]]; then
+        mapfile -t keys < <(printf '%s\n' "${LOCAL_ONLY[@]:-}" "${CHANGED[@]:-}" | grep -v '^$' || true)
+    else
+        mapfile -t keys < <(printf '%s\n' "${LOCAL_ONLY[@]:-}" | grep -v '^$' || true)
     fi
 
-    (( ${#keys[@]} )) || { log_success "Nothing to push"; return 0; }
+    (( ${#keys[@]} )) || { log_success "Nothing to push — $ENV has every key in $ENV_FILE_NAME"; return 0; }
 
     echo ""
-    echo "Push to $ENV ($REPO_NAME):"
-    printf '  %s\n' "${keys[@]}"
+    if [[ "$ENV" == "dev" ]]; then
+        echo "Push to $ENV ($REPO_NAME) — values from $ENV_FILE_NAME:"
+    else
+        echo "Push to $ENV ($REPO_NAME) — you will be prompted for each value:"
+    fi
+
+    local key
+    for key in "${keys[@]}"; do
+        if [[ -n "${REMOTE_IDS[$key]:-}" ]]; then
+            echo -e "  ${YELLOW}~${NC} $key ${DIM}(overwrites existing $ENV value)${NC}"
+        else
+            echo -e "  ${GREEN}+${NC} $key ${DIM}(new)${NC}"
+        fi
+    done
     echo ""
     confirm "Continue?" || exit 0
     echo ""
 
-    local key value
+    local value
     for key in "${keys[@]}"; do
         if [[ "$ENV" == "dev" ]]; then
             [[ -n "${LOCAL_VALS[$key]+x}" ]] || { log_warn "skipped $key (not in $ENV_FILE_NAME)"; continue; }
             put_secret "$key" "${LOCAL_VALS[$key]}"
         else
             local hint="new"
-            [[ -n "${REMOTE_IDS[$key]:-}" ]] && hint="has existing value — Enter to keep"
+            [[ -n "${REMOTE_IDS[$key]:-}" ]] && hint="Enter to keep current"
             read -rp "$(echo -e "${CYAN}?${NC} $key ${DIM}($hint)${NC}: ")" value
-            [[ -z "$value" ]] && { log_info "kept $key"; continue; }
+            [[ -z "$value" ]] && { log_info "skipped $key"; continue; }
             put_secret "$key" "$value"
         fi
     done
