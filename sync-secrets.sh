@@ -608,24 +608,38 @@ cmd_wire() {
 
     local tmp
     tmp=$(mktemp)
+    # Replace the ENTIRE `secrets: |` block, delimited by indentation — not by
+    # matching mapping lines one at a time. Real blocks carry interleaved
+    # comments and stale duplicate entries; a line-by-line matcher stops at the
+    # first comment and leaves the rest behind, half-wired.
     awk -v new_secrets="$lines" '
-        /secrets: \|/ { print; in_secrets = 1; printed = 0; next }
+        match($0, /^[[:space:]]*/) && /secrets:[[:space:]]*\|/ {
+            print
+            block_indent = RLENGTH
+            in_secrets = 1
+            print new_secrets
+            next
+        }
         in_secrets {
-            if (/^[[:space:]]+[a-f0-9-]+ >/ || /^[[:space:]]+[a-f0-9]+-xxxx/) {
-                if (!printed) { print new_secrets; printed = 1 }
-                next
-            }
-            in_secrets = 0
+            if ($0 ~ /^[[:space:]]*$/) { next }          # blank line inside block
+            match($0, /^[[:space:]]*/)
+            if (RLENGTH > block_indent) { next }          # block content — drop it
+            in_secrets = 0                                # dedented: block over
         }
         { print }
     ' "$workflow" > "$tmp"
+
+    if cmp -s "$tmp" "$workflow"; then
+        rm -f "$tmp"
+        die "Nothing changed in deploy-${ENV}.yml — no 'secrets: |' block with '<uuid> > KEY' lines found"
+    fi
     mv "$tmp" "$workflow"
 
     log_success "Wired ${#REMOTE_IDS[@]} UUIDs into deploy-${ENV}.yml"
 
     local gh_repo
     gh_repo=$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null \
-        | sed -E 's#.*github\.com[:/]([^/]+/[^/]+?)(\.git)?$#\1#') || true
+        | sed -E 's#\.git$##; s#.*github\.com[:/]##') || true
     [[ -n "$gh_repo" ]] || return 0
     command -v gh >/dev/null || return 0
 
