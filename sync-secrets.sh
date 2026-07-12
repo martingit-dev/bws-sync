@@ -305,6 +305,31 @@ cmd_push() {
 
 # ---------------------------------------------------------------- pull
 
+# Rewrite one KEY= line in place, preserving everything else. Done in bash
+# rather than sed so that secret values are never parsed as pattern syntax.
+replace_env_line() {
+    local key="$1" value="$2" tmp line found="no"
+    tmp=$(mktemp)
+    if [[ -f "$ENV_FILE" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?"$key"[[:space:]]*= ]]; then
+                printf '%s%s=%s\n' "${BASH_REMATCH[1]:-}" "$key" "$value"
+                found="yes"
+            else
+                printf '%s\n' "$line"
+            fi
+        done < "$ENV_FILE" > "$tmp"
+    fi
+    [[ "$found" == "yes" ]] || printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$ENV_FILE"
+
+    if [[ "$found" == "yes" ]]; then
+        log_success "updated $key in $ENV_FILE_NAME"
+    else
+        log_success "appended $key to $ENV_FILE_NAME"
+    fi
+}
+
 cmd_pull() {
     [[ "$ENV" == "dev" ]] || die "pull is dev-only — staging/production values must not land in $ENV_FILE_NAME"
     load_state
@@ -319,14 +344,7 @@ cmd_pull() {
         local key
         for key in "${keys[@]}"; do
             [[ -n "${REMOTE_IDS[$key]:-}" ]] || { log_warn "skipped $key (not in BWS)"; continue; }
-            local escaped="${REMOTE_VALS[$key]//\\/\\\\}"; escaped="${escaped//&/\\&}"
-            if grep -qE "^[[:space:]]*(export[[:space:]]+)?$key[[:space:]]*=" "$ENV_FILE" 2>/dev/null; then
-                sed -i -E "s|^([[:space:]]*(export[[:space:]]+)?$key[[:space:]]*=).*|\1$escaped|" "$ENV_FILE"
-                log_success "updated $key in $ENV_FILE_NAME"
-            else
-                echo "$key=${REMOTE_VALS[$key]}" >> "$ENV_FILE"
-                log_success "appended $key to $ENV_FILE_NAME"
-            fi
+            replace_env_line "$key" "${REMOTE_VALS[$key]}"
         done
         return 0
     fi
