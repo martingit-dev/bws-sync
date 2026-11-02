@@ -40,9 +40,11 @@ ${BOLD}COMMANDS${NC}
                   Requires --source-env; never copies a whole project implicitly.
   ${BOLD}run${NC} -- CMD...    Run a command with this environment's BWS project injected.
                   No .env file is read or written.
-  ${BOLD}wire${NC}            Rewrite .github/workflows/deploy-<env>.yml with the current
-                  'UUID > KEY' block, and set BWS_ACCESS_TOKEN on the GitHub
-                  environment. Produces a repo diff you commit.
+  ${BOLD}wire${NC} [KEY...]   Update the deploy workflow's 'UUID > KEY' block from BWS and
+                  set BWS_ACCESS_TOKEN on the GitHub environment if missing.
+                  Named KEYs = add or update only those lines. No KEY = mirror
+                  the whole project (shows what it would add, then confirms).
+                  Produces a repo diff you commit.
 
 ${BOLD}FLAGS${NC}
   -e, --env <dev|staging|production>   Which environment. Default: dev.
@@ -91,7 +93,9 @@ ${BOLD}SETTING UP A NEW ENVIRONMENT${NC}
     5. bws-sync wire -e production   points the workflow at the new UUIDs.
 
 ${BOLD}FILES${NC}
-  .bws-sync.toml   Project UUIDs. Not secret: commit it.
+  .bws-sync.toml   Project UUIDs, and optionally [workflows] <env> = "<path>"
+                   when a deploy workflow isn't .github/workflows/deploy-<env>.yml.
+                   Not secret: commit it.
   .env             Real dev values. Gitignore it.
   \$BWS_SYNC_CONFIG_DIR/secrets.conf
                    Access tokens, one per environment. Never in a repo.
@@ -381,7 +385,7 @@ cmd_status() {
     return 1
 }
 
-join_keys() { printf '%s' "$1"; shift; printf ', %s' "$@"; echo; }
+join_keys() { printf '%s' "$1"; shift; (( $# )) && printf ', %s' "$@"; echo; }
 
 # Keys to act on: explicit args, else the drift set passed in.
 select_keys() {
@@ -715,49 +719,131 @@ cmd_run() {
 
 # ---------------------------------------------------------------- wire
 
+# The deploy workflow for $ENV: [workflows] in .bws-sync.toml, else the
+# conventional .github/workflows/deploy-<env>.yml.
+workflow_path() {
+    local rel
+    rel=$(read_toml "$ENV" workflows)
+    printf '%s' "$REPO_PATH/${rel:-.github/workflows/deploy-${ENV}.yml}"
+}
+
+# The `UUID > KEY` lines currently in the workflow's `secrets: |` block, as
+# KEY<TAB>UUID.
+workflow_mappings() {
+    awk '
+        match($0, /^[[:space:]]*/) && /secrets:[[:space:]]*\|/ { in_s = 1; ind = RLENGTH; next }
+        in_s {
+            if ($0 ~ /^[[:space:]]*$/) next
+            match($0, /^[[:space:]]*/)
+            if (RLENGTH <= ind) { in_s = 0; next }
+            if ($1 ~ /^[0-9a-fA-F-]+$/ && $2 == ">") print $3 "\t" $1
+        }' "$1"
+}
+
 cmd_wire() {
     load_state
 
-    local workflow="$REPO_PATH/.github/workflows/deploy-${ENV}.yml"
-    [[ -f "$workflow" ]] || die "No workflow: .github/workflows/deploy-${ENV}.yml"
+    local workflow rel
+    workflow=$(workflow_path)
+    rel="${workflow#"$REPO_PATH"/}"
+    [[ -f "$workflow" ]] || die "No workflow: $rel (set [workflows] $ENV in .bws-sync.toml)"
     (( ${#REMOTE_IDS[@]} )) || die "No secrets in BWS project $PROJECT_ID"
 
-    local lines="" key
-    for key in $(printf '%s\n' "${!REMOTE_IDS[@]}" | sort); do
-        lines+="            ${REMOTE_IDS[$key]} > ${key}"$'\n'
-    done
-    lines="${lines%$'\n'}"
+    declare -A current=() target=()
+    local order=() key id
+    while IFS=$'\t' read -r key id; do
+        [[ -n "$key" ]] || continue
+        current["$key"]="$id"
+        order+=("$key")
+    done < <(workflow_mappings "$workflow")
 
-    local tmp
-    tmp=$(mktemp)
-    # Replace the ENTIRE `secrets: |` block, delimited by indentation, not by
-    # matching mapping lines one at a time. Real blocks carry interleaved
-    # comments and stale duplicate entries; a line-by-line matcher stops at the
-    # first comment and leaves the rest behind, half-wired.
-    awk -v new_secrets="$lines" '
-        match($0, /^[[:space:]]*/) && /secrets:[[:space:]]*\|/ {
-            print
-            block_indent = RLENGTH
-            in_secrets = 1
-            print new_secrets
-            next
-        }
-        in_secrets {
-            if ($0 ~ /^[[:space:]]*$/) { next }          # blank line inside block
-            match($0, /^[[:space:]]*/)
-            if (RLENGTH > block_indent) { next }          # block content: drop it
-            in_secrets = 0                                # dedented: block over
-        }
-        { print }
-    ' "$workflow" > "$tmp"
-
-    if cmp -s "$tmp" "$workflow"; then
-        rm -f "$tmp"
-        die "Nothing changed in deploy-${ENV}.yml: no 'secrets: |' block with '<uuid> > KEY' lines found"
+    # Named keys narrow the change to those keys; every other line stays as
+    # it is. Bare wire makes the block mirror the whole BWS project.
+    if (( ${#KEYS_ARG[@]} )); then
+        for key in "${!current[@]}"; do target["$key"]="${current[$key]}"; done
+        local missing=()
+        for key in "${KEYS_ARG[@]}"; do
+            if [[ -n "${REMOTE_IDS[$key]:-}" ]]; then target["$key"]="${REMOTE_IDS[$key]}"
+            else missing+=("$key"); fi
+        done
+        (( ${#missing[@]} == 0 )) \
+            || die "Not in BWS $ENV: $(join_keys "${missing[@]}"). Push them first."
+    else
+        for key in "${!REMOTE_IDS[@]}"; do target["$key"]="${REMOTE_IDS[$key]}"; done
     fi
-    mv "$tmp" "$workflow"
 
-    log_success "Wired ${#REMOTE_IDS[@]} UUIDs into deploy-${ENV}.yml"
+    local added=() removed=() changed=() untouched=0
+    for key in "${!target[@]}"; do
+        if [[ -z "${current[$key]:-}" ]]; then added+=("$key")
+        elif [[ "${current[$key]}" != "${target[$key]}" ]]; then changed+=("$key")
+        else untouched=$((untouched + 1)); fi
+    done
+    for key in "${!current[@]}"; do
+        [[ -n "${target[$key]:-}" ]] || removed+=("$key")
+    done
+
+    if (( ${#added[@]} + ${#removed[@]} + ${#changed[@]} == 0 )); then
+        log_success "$rel already wired for $ENV"
+    else
+        echo ""
+        echo "Wire $ENV → $rel:"
+        for key in $(printf '%s\n' "${added[@]}" | sort); do
+            echo -e "  ${GREEN}+${NC} $key ${DIM}${target[$key]}${NC}"
+        done
+        for key in $(printf '%s\n' "${changed[@]}" | sort); do
+            echo -e "  ${YELLOW}~${NC} $key ${DIM}${current[$key]} → ${target[$key]}${NC}"
+        done
+        for key in $(printf '%s\n' "${removed[@]}" | sort); do
+            echo -e "  ${RED}-${NC} $key ${DIM}(not in BWS $ENV)${NC}"
+        done
+        (( untouched )) && echo -e "  ${DIM}$untouched existing line(s) untouched${NC}"
+        if (( ! ${#KEYS_ARG[@]} && ${#added[@]} )); then
+            log_warn "  + gives this deploy secrets it does not receive today."
+            log_warn "  Name keys to wire only those: bws-sync wire -e $ENV KEY..."
+        fi
+        echo ""
+        confirm "Continue?" || exit 0
+
+        # Existing lines keep their place so the diff shows only what changed;
+        # new keys go at the end.
+        local lines=""
+        for key in "${order[@]}"; do
+            [[ -n "${target[$key]:-}" ]] && lines+="            ${target[$key]} > ${key}"$'\n'
+        done
+        for key in $(printf '%s\n' "${added[@]}" | sort); do
+            lines+="            ${target[$key]} > ${key}"$'\n'
+        done
+        lines="${lines%$'\n'}"
+
+        # Replace the ENTIRE `secrets: |` block, delimited by indentation, not
+        # by matching UUID lines: a stale or malformed line must not survive.
+        local tmp
+        tmp=$(mktemp)
+        awk -v new_secrets="$lines" '
+            match($0, /^[[:space:]]*/) && /secrets:[[:space:]]*\|/ {
+                print
+                block_indent = RLENGTH
+                in_secrets = 1
+                print new_secrets
+                next
+            }
+            in_secrets {
+                # A blank line belongs to the block only if more block follows;
+                # one before the next step is layout, so it is kept.
+                if ($0 ~ /^[[:space:]]*$/) { blanks++; next }
+                match($0, /^[[:space:]]*/)
+                if (RLENGTH > block_indent) { blanks = 0; next }   # block content: drop it
+                in_secrets = 0                                     # dedented: block over
+                for (; blanks > 0; blanks--) print ""
+            }
+            { print }
+            END { for (; blanks > 0; blanks--) print "" }
+        ' "$workflow" > "$tmp"
+        cmp -s "$tmp" "$workflow" \
+            && { rm -f "$tmp"; die "Nothing changed in $rel: no 'secrets: |' block found"; }
+        mv "$tmp" "$workflow"
+        log_success "Wired $rel (${#added[@]} added, ${#changed[@]} changed, ${#removed[@]} removed)"
+    fi
 
     local gh_repo
     gh_repo=$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null \

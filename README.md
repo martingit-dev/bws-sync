@@ -181,7 +181,7 @@ Commands:
   push       push .env values to BWS (all drifted keys, or just KEY...)
   pull       pull BWS values into .env (dev only; all keys, or just KEY...)
   prune      delete BWS secrets that no longer exist in .env
-  wire       rewrite deploy-<env>.yml with current secret UUIDs
+  wire       update the deploy workflow's secret UUIDs (all, or named keys)
 
 Flags:
   -e, --env <dev|staging|production>   default: dev
@@ -269,10 +269,21 @@ Deletion in BWS is permanent, so this always confirms.
 ### GitHub Actions Integration
 
 ```bash
-bws-sync wire -e production
+bws-sync wire -e production LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET   # add or update only these
+bws-sync wire -e production                                         # mirror the whole project
 ```
 
-This rewrites the `secrets: |` block in `.github/workflows/deploy-<env>.yml` with the current `UUID > KEY` mappings, then makes sure the GitHub environment exists and has `BWS_ACCESS_TOKEN` set. Commit the workflow diff afterwards.
+This updates the `secrets: |` block in the deploy workflow with `UUID > KEY` mappings from BWS, then makes sure the GitHub environment exists and has `BWS_ACCESS_TOKEN` set. Commit the workflow diff afterwards.
+
+Name the keys you just pushed. Every other line stays exactly where it is, so the diff shows only what you added. Bare `wire` makes the block mirror the whole BWS project, which can hand a deploy secrets meant for something else (a backup job's cloud keys, say), so it lists every line it would add, change or remove and confirms first.
+
+Existing lines keep their order; new keys are appended. If a repo's workflow isn't `.github/workflows/deploy-<env>.yml`, name it in `.bws-sync.toml`:
+
+```toml
+[workflows]
+staging    = ".github/workflows/deploy-api-staging.yml"
+production = ".github/workflows/deploy-api-production.yml"
+```
 
 Keeping this behind its own command means a routine `push` no longer rewrites files in your repo as a side effect.
 
