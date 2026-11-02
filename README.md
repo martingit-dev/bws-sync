@@ -214,6 +214,35 @@ bws-sync push -e production API_KEY  # production: prompt for one value
 
 For **dev**, values come straight from `.env`. For **staging and production**, the script prompts you for each value — press Enter to keep whatever BWS already has. Nothing is ever copied from your dev `.env` into a higher environment.
 
+### Runtime injection (`bws run`)
+
+Run an application with one environment's BWS project injected only into that
+child process:
+
+```bash
+bws-sync run -e staging -- python my_script.py
+```
+
+This is the local/runtime counterpart to `bitwarden/sm-action`: the application
+keeps reading ordinary environment variables, but no plaintext `.env` file is
+created. The child can read its own environment, so the environment's machine
+account should remain least-privilege and project-scoped.
+
+### Copy named secrets between environments
+
+Provision shared values once without copying and pasting plaintext:
+
+```bash
+bws-sync copy -e production --source-env staging \
+  SANDBOX_SERVICE_URL SANDBOX_SERVICE_TOKEN
+```
+
+`copy` requires explicit key names and never clones a whole project implicitly.
+Values stay in process memory and the output contains only safe workflow
+`UUID > KEY` mappings. Environment-specific credentials should still be created
+independently; for example, copy a shared sandbox service bearer, but generate a
+new run-token signing secret and set the production callback URL separately.
+
 ### Pull
 
 ```bash

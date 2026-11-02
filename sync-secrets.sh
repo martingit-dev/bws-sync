@@ -35,12 +35,18 @@ ${BOLD}COMMANDS${NC}
   ${BOLD}pull${NC} [KEY...]   Bring values into .env. No KEY = rewrite the file (backs up
                   to .env.bak). Named KEYs = replace only those lines. Dev only.
   ${BOLD}prune${NC} [KEY...]  Delete BWS secrets that no longer exist in .env. Permanent.
+  ${BOLD}copy${NC} KEY...     Copy explicitly named values from another BWS environment
+                  into the selected environment and print their new UUID mappings.
+                  Requires --source-env; never copies a whole project implicitly.
+  ${BOLD}run${NC} -- CMD...    Run a command with this environment's BWS project injected.
+                  No .env file is read or written.
   ${BOLD}wire${NC}            Rewrite .github/workflows/deploy-<env>.yml with the current
                   'UUID > KEY' block, and set BWS_ACCESS_TOKEN on the GitHub
                   environment. Produces a repo diff you commit.
 
 ${BOLD}FLAGS${NC}
   -e, --env <dev|staging|production>   Which environment. Default: dev.
+      --source-env <environment>       Source environment for copy.
   -d, --dir <path>                     Which project. Default: current directory.
   -y, --yes                            Skip confirmations.
   -h, --help                           This.
@@ -53,10 +59,12 @@ ${BOLD}ALL vs ONE${NC}
     bws-sync push                  # push every drifted dev key
     bws-sync push STRIPE_KEY       # push only that one
     bws-sync pull DATABASE_URL     # pull only that one, rest of .env untouched
+    bws-sync copy -e production --source-env staging SANDBOX_SERVICE_URL
+    bws-sync run -e staging -- python my_script.py
 
 ${BOLD}ENVIRONMENTS${NC}
-  Environments share their ${BOLD}keys${NC}, never their ${BOLD}values${NC}. Nothing is ever copied
-  from dev into staging or production.
+  Environments share their ${BOLD}keys${NC}, not their values by default. Values cross an
+  environment boundary only through an explicit, named-key ${BOLD}copy${NC} command.
 
   dev         Values live in .env. Push reads it, pull writes it, status
               compares keys AND values.
@@ -92,23 +100,26 @@ EOF
 
 CMD="status"
 ENV="dev"
+SOURCE_ENV=""
 REPO_PATH="$PWD"
 ASSUME_YES="no"
 FROM_FILE=""
 KEYS_ARG=()
 
 case "${1:-}" in
-    init|status|push|pull|prune|wire) CMD="$1"; shift ;;
+    init|status|push|pull|prune|copy|run|wire) CMD="$1"; shift ;;
     -h|--help|help) usage 0 ;;
 esac
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -e|--env)  ENV="${2:-}"; shift 2 ;;
+        --source-env) SOURCE_ENV="${2:-}"; shift 2 ;;
         -d|--dir)  REPO_PATH="${2:-}"; shift 2 ;;
         -f|--from) FROM_FILE="${2:-}"; shift 2 ;;
         -y|--yes)  ASSUME_YES="yes"; shift ;;
         -h|--help) usage 0 ;;
+        --) shift; KEYS_ARG+=("$@"); break ;;
         -*)        die "Unknown flag: $1" ;;
         *)         KEYS_ARG+=("$1"); shift ;;
     esac
@@ -119,6 +130,14 @@ case "$ENV" in
     prod) ENV="production" ;;
     *) die "Invalid env: $ENV (dev|staging|production)" ;;
 esac
+
+if [[ -n "$SOURCE_ENV" ]]; then
+    case "$SOURCE_ENV" in
+        dev|staging|production) ;;
+        prod) SOURCE_ENV="production" ;;
+        *) die "Invalid source env: $SOURCE_ENV (dev|staging|production)" ;;
+    esac
+fi
 
 [[ -d "$REPO_PATH" ]] || die "Not a directory: $REPO_PATH"
 REPO_PATH="$(cd "$REPO_PATH" && pwd)"
@@ -140,12 +159,18 @@ confirm() {
 PROJECT_FILE="$REPO_PATH/.bws-sync.toml"
 
 load_token() {
+    ACCESS_TOKEN=$(token_for_env "$ENV")
+}
+
+token_for_env() {
+    local environment="$1"
     [[ -f "$CONFIG_FILE" ]] || die "No token config: $CONFIG_FILE (see README)"
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
-    local var="BWS_ACCESS_TOKEN_$(echo "$ENV" | tr '[:lower:]' '[:upper:]')"
-    ACCESS_TOKEN="${!var:-}"
-    [[ -n "$ACCESS_TOKEN" ]] || die "$var not set in $CONFIG_FILE"
+    local var="BWS_ACCESS_TOKEN_$(echo "$environment" | tr '[:lower:]' '[:upper:]')"
+    local token="${!var:-}"
+    [[ -n "$token" ]] || die "$var not set in $CONFIG_FILE"
+    printf '%s' "$token"
 }
 
 load_project() {
@@ -157,6 +182,14 @@ load_project() {
 
     PROJECT_ID=$(read_toml "$ENV" projects)
     [[ -n "$PROJECT_ID" ]] || die "No '$ENV' project ID in .bws-sync.toml — run: bws-sync init"
+}
+
+project_for_env() {
+    local environment="$1" project
+    [[ -f "$PROJECT_FILE" ]] || die "No .bws-sync.toml in $REPO_NAME — run: bws-sync init"
+    project=$(read_toml "$environment" projects)
+    [[ -n "$project" ]] || die "No '$environment' project ID in .bws-sync.toml — run: bws-sync init"
+    printf '%s' "$project"
 }
 
 # Reads one `key = "value"` out of .bws-sync.toml. Section-aware for [projects].
@@ -591,6 +624,87 @@ cmd_prune() {
     done
 }
 
+# ---------------------------------------------------------------- copy / run
+
+# Copy is deliberately key-explicit. Environment projects share names while
+# holding intentionally different credentials, so an implicit "copy all" would
+# undo the isolation. Values stay in process memory: never printed, never
+# written to a file.
+cmd_copy() {
+    [[ -n "$SOURCE_ENV" ]] || die "copy requires --source-env <environment>"
+    [[ "$SOURCE_ENV" != "$ENV" ]] || die "copy source and destination are both '$ENV'"
+    (( ${#KEYS_ARG[@]} )) || die "copy requires one or more explicit KEY names"
+
+    load_project
+    local target_project="$PROJECT_ID"
+    local target_token
+    target_token=$(token_for_env "$ENV")
+
+    local source_project source_token source_json
+    source_project=$(project_for_env "$SOURCE_ENV")
+    source_token=$(token_for_env "$SOURCE_ENV")
+    log_info "Fetching named values from $SOURCE_ENV…"
+    source_json=$(bws secret list "$source_project" -t "$source_token" -o json) \
+        || die "Cannot read source project $source_project in $SOURCE_ENV"
+
+    # Load the destination IDs so put_secret updates rather than duplicates.
+    ACCESS_TOKEN="$target_token"
+    PROJECT_ID="$target_project"
+    fetch_remote
+
+    declare -A source_values=()
+    local key encoded
+    while IFS=$'\t' read -r key encoded; do
+        [[ -n "$key" ]] || continue
+        source_values["$key"]=$(printf '%s' "$encoded" | base64 -d)
+    done < <(printf '%s' "$source_json" | jq -r '.[] | [.key, (.value | @base64)] | @tsv')
+    unset source_json source_token target_token
+
+    local missing=()
+    for key in "${KEYS_ARG[@]}"; do
+        [[ -n "${source_values[$key]+x}" ]] || missing+=("$key")
+    done
+    (( ${#missing[@]} == 0 )) \
+        || die "Missing from $SOURCE_ENV: $(join_keys "${missing[@]}")"
+
+    echo ""
+    echo "Copy $SOURCE_ENV → $ENV ($REPO_NAME):"
+    for key in "${KEYS_ARG[@]}"; do
+        if [[ -n "${REMOTE_IDS[$key]:-}" ]]; then
+            echo -e "  ${YELLOW}~${NC} $key ${DIM}(overwrite destination)${NC}"
+        else
+            echo -e "  ${GREEN}+${NC} $key ${DIM}(create destination)${NC}"
+        fi
+    done
+    echo ""
+    confirm "Continue?" || exit 0
+
+    for key in "${KEYS_ARG[@]}"; do
+        put_secret "$key" "${source_values[$key]}"
+        unset 'source_values[$key]'
+    done
+
+    echo ""
+    echo "Workflow mappings:"
+    for key in "${KEYS_ARG[@]}"; do
+        [[ -n "${REMOTE_IDS[$key]:-}" ]] \
+            && printf '  %s > %s\n' "${REMOTE_IDS[$key]}" "$key"
+    done
+}
+
+cmd_run() {
+    (( ${#KEYS_ARG[@]} )) || die "run requires a command after --"
+    load_token
+    load_project
+
+    # The child sees only this project's secrets: --no-inherit-env keeps the
+    # caller's shell credentials, and BWS_ACCESS_TOKEN itself, out of it. It
+    # can still read what it was given, so the machine account stays scoped
+    # to the one project.
+    BWS_ACCESS_TOKEN="$ACCESS_TOKEN" exec bws run --no-inherit-env \
+        --project-id "$PROJECT_ID" -- "${KEYS_ARG[@]}"
+}
+
 # ---------------------------------------------------------------- wire
 
 cmd_wire() {
@@ -665,5 +779,7 @@ case "$CMD" in
     push)   cmd_push ;;
     pull)   cmd_pull ;;
     prune)  cmd_prune ;;
+    copy)   cmd_copy ;;
+    run)    cmd_run ;;
     wire)   cmd_wire ;;
 esac
