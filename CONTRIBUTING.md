@@ -16,7 +16,7 @@ Thanks for your interest in contributing!
 
 - Keep it simple. This is a single-script tool and should stay that way.
 - Test your changes against all three environment flows (dev, staging, production).
-- Follow the existing code style (bash, `set -e`, colored log functions).
+- Follow the existing code style (bash, `set -euo pipefail`, the `log_*` functions).
 - Don't introduce new dependencies unless absolutely necessary.
 
 ## Reporting Issues

@@ -30,28 +30,33 @@ ${BOLD}COMMANDS${NC}
                   prompts, exits 1 if anything differs.
   ${BOLD}init${NC}            Write .bws-sync.toml: this repo's BWS project IDs, one per
                   environment. Run once per project. Safe to commit.
-  ${BOLD}push${NC} [KEY...]   Send values to BWS. No KEY = every key that is new or
-                  changed. Named KEYs = only those.
+  ${BOLD}push${NC} [KEY...]   Send values to BWS. No KEY = every drifted key (dev: new or
+                  changed; staging/production: keys BWS lacks). Named KEYs =
+                  only those.
   ${BOLD}pull${NC} [KEY...]   Bring values into .env. No KEY = rewrite the file (backs up
                   to .env.bak). Named KEYs = replace only those lines. Dev only.
-  ${BOLD}prune${NC} [KEY...]  Delete BWS secrets that no longer exist in .env. Permanent.
+  ${BOLD}prune${NC} [KEY...]  Delete BWS secrets that no longer exist in .env, or only the
+                  named KEYs. Permanent.
   ${BOLD}copy${NC} KEY...     Copy explicitly named values from another BWS environment
                   into the selected environment and print their new UUID mappings.
                   Requires --source-env; never copies a whole project implicitly.
-  ${BOLD}run${NC} -- CMD...    Run a command with this environment's BWS project injected.
-                  No .env file is read or written.
+  ${BOLD}run${NC} -- CMD...   Run CMD with this environment's BWS secrets as its only
+                  environment (bws run --no-inherit-env). No .env is read or
+                  written.
   ${BOLD}wire${NC} [KEY...]   Update the deploy workflow's 'UUID > KEY' block from BWS and
                   set BWS_ACCESS_TOKEN on the GitHub environment if missing.
-                  Named KEYs = add or update only those lines. No KEY = mirror
-                  the whole project (shows what it would add, then confirms).
+                  Named KEYs = add or update only those lines; the rest keep
+                  their place, new ones go last. No KEY = mirror the whole
+                  project (previews +/~/- lines, then confirms).
                   Produces a repo diff you commit.
 
 ${BOLD}FLAGS${NC}
   -e, --env <dev|staging|production>   Which environment. Default: dev.
       --source-env <environment>       Source environment for copy.
-  -f, --from <file>                    Staging/production values from a file instead
-                                       of prompts. Must be gitignored or outside the
-                                       repo; offered for shredding after the push.
+  -f, --from <file>                    Push values from a KEY=VALUE file instead of
+                                       prompts or .env. Bare push sends exactly its
+                                       keys. Must be gitignored or outside the repo;
+                                       offered for shredding after the push.
   -d, --dir <path>                     Which project. Default: current directory.
   -y, --yes                            Skip confirmations.
   -h, --help                           This.
@@ -73,16 +78,18 @@ ${BOLD}ENVIRONMENTS${NC}
 
   dev         Values live in .env. Push reads it, pull writes it, status
               compares keys AND values.
-  staging     Values live only in BWS. Push ${BOLD}prompts${NC} you for each one, input
+  staging     Values live only in BWS. Push ${BOLD}prompts${NC} for each value, input
   production  hidden (Enter keeps what BWS already has), or reads them from
-              --from FILE. Status compares keys only: these values are never
+              --from FILE. Bare push asks only for keys BWS lacks; name a key
+              to change it. Status compares keys only: these values are never
               written to .env or printed. Pull is refused.
 
 ${BOLD}SETTING UP A NEW ENVIRONMENT${NC}
   Say production, on a project that already has dev working:
 
-    1. In the Bitwarden web vault: create the project, create a machine account,
-       grant it access, issue an access token. (No CLI or API exists for this.)
+    1. Create the BWS project (web vault or bws project create). In the web
+       vault, create a machine account, grant it access, issue an access
+       token. (No CLI or API exists for those three.)
     2. Add the token to \$BWS_SYNC_CONFIG_DIR/secrets.conf as
        BWS_ACCESS_TOKEN_PRODUCTION.
     3. bws-sync init          adds the production project ID.
@@ -99,7 +106,7 @@ ${BOLD}FILES${NC}
   .env             Real dev values. Gitignore it.
   \$BWS_SYNC_CONFIG_DIR/secrets.conf
                    Access tokens, one per environment. Never in a repo.
-                   Currently: $CONFIG_DIR
+                   Currently: $CONFIG_FILE
 EOF
     exit "${1:-0}"
 }
@@ -200,7 +207,8 @@ project_for_env() {
     printf '%s' "$project"
 }
 
-# Reads one `key = "value"` out of .bws-sync.toml. Section-aware for [projects].
+# One `key = "value"` from .bws-sync.toml: top level by default, else from the
+# named [section].
 read_toml() {
     local want="$1" section="${2:-}"
     [[ -f "$PROJECT_FILE" ]] || return 0
@@ -240,10 +248,10 @@ cmd_init() {
         log_info "Project IDs for $REPO_NAME (blank to skip an environment)"
     fi
 
-    dev=$(ask_with_default "dev:       " "$dev")
-    staging=$(ask_with_default "staging:   " "$staging")
-    production=$(ask_with_default "production:" "$production")
-    env_file=$(ask_with_default "env file:  " "${env_file:-.env}")
+    dev=$(ask_with_default "dev" "$dev")
+    staging=$(ask_with_default "staging" "$staging")
+    production=$(ask_with_default "production" "$production")
+    env_file=$(ask_with_default "env file" "${env_file:-.env}")
 
     {
         echo "# bws-sync: BWS project IDs for this repo."
@@ -457,9 +465,9 @@ cmd_push() {
     # staging/production we cannot see drift in values, so it's the keys BWS is
     # missing; an existing key is changed by naming it, never by Entering past it.
     #
-    # --from narrows rather than widens: if a file is given, it IS the intent:
-    # push exactly its keys. Not every key it declares lives in .env (seed-only
-    # secrets, for one), and drift computed from .env would silently drop them.
+    # A --from file is the intent, so bare push sends exactly its keys. Not
+    # every key it declares lives in .env (seed-only secrets, for one), and
+    # drift computed from .env would silently drop them.
     local keys=()
     if (( ${#KEYS_ARG[@]} )); then
         mapfile -t keys < <(printf '%s\n' "${KEYS_ARG[@]}")
@@ -471,7 +479,7 @@ cmd_push() {
         mapfile -t keys < <(printf '%s\n' "${LOCAL_ONLY[@]:-}" | grep -v '^$' || true)
     fi
 
-    (( ${#keys[@]} )) || { log_success "Nothing to push: $ENV has every key in $ENV_FILE_NAME"; return 0; }
+    (( ${#keys[@]} )) || { log_success "Nothing to push: no drift between $ENV_FILE_NAME and $ENV"; return 0; }
 
     # Where each value will come from, so the confirmation can say so per key.
     # An explicit --from wins over .env, including for dev.
@@ -525,7 +533,7 @@ cmd_push() {
 # ---------------------------------------------------------------- pull
 
 # pull writes plaintext secrets to disk. Refuse to do that silently if git
-# would track them. Only warns when the target is actually a git repo.
+# would track them.
 warn_if_tracked() {
     git -C "$REPO_PATH" rev-parse --git-dir &>/dev/null || return 0
 

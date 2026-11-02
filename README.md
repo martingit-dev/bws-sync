@@ -42,6 +42,8 @@
         <li><a href="#push">Push</a></li>
         <li><a href="#pull">Pull</a></li>
         <li><a href="#prune">Prune</a></li>
+        <li><a href="#copy-named-secrets-between-environments">Copy Named Secrets Between Environments</a></li>
+        <li><a href="#run-with-secrets-injected">Run With Secrets Injected</a></li>
         <li><a href="#github-actions-integration">GitHub Actions Integration</a></li>
         <li><a href="#what-stays-manual">What Stays Manual</a></li>
       </ul>
@@ -66,9 +68,9 @@ $ bws-sync
 my-api · dev · .env
   12 in sync   +2 local-only   -1 bws-only   ~3 changed
 
-  + RESEND_KEY, STRIPE_KEY   (in .env, not in BWS)
-  - OLD_API_URL              (in BWS, not in .env)
-  ~ DATABASE_URL, LOG_LEVEL, PORT   (values differ)
+  + RESEND_KEY, STRIPE_KEY (in .env, not in BWS)
+  - OLD_API_URL (in BWS, not in .env)
+  ~ DATABASE_URL, LOG_LEVEL, PORT (values differ)
 
   bws-sync push [KEY…]   ·   bws-sync pull [KEY…]   ·   bws-sync prune
 ```
@@ -149,11 +151,11 @@ brew install bitwarden/bws/bws gh jq
    $ cd ~/code/my-api
    $ bws-sync init
    i Project IDs for my-api (blank to skip an environment)
-     dev:        4f2c...
-     staging:    9a71...
+     dev: 4f2c...
+     staging: 9a71...
      production:
      env file [.env]:
-   ✓ Wrote .bws-sync.toml (safe to commit)
+   ✓ Wrote /home/you/code/my-api/.bws-sync.toml (safe to commit)
    ```
 
    This writes `.bws-sync.toml`, so you never type a project ID again:
@@ -166,7 +168,7 @@ brew install bitwarden/bws/bws gh jq
    staging = "9a71…"
    ```
 
-   **Commit it.** A BWS project ID is a UUID, not a credential: it is useless without an access token, and tokens live only in `~/.config/bws-sync/`.
+   **Commit it.** A BWS project ID is a UUID, not a credential: it is useless without an access token, and tokens live only in `$BWS_SYNC_CONFIG_DIR` (default `~/.config/bws-sync/`).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -178,15 +180,20 @@ bws-sync [command] [KEY...] [flags]
 Commands:
   (none)     status: show drift between .env and BWS. Read-only, no prompts.
   init       write .bws-sync.toml with this repo's project IDs
-  push       push .env values to BWS (all drifted keys, or just KEY...)
+  push       send values to BWS (all drifted keys, or just KEY...)
   pull       pull BWS values into .env (dev only; all keys, or just KEY...)
-  prune      delete BWS secrets that no longer exist in .env
+  prune      delete BWS secrets that no longer exist in .env (or just KEY...)
+  copy       copy named KEYs from --source-env into -e
+  run        run -- CMD with the environment's secrets injected
   wire       update the deploy workflow's secret UUIDs (all, or named keys)
 
 Flags:
   -e, --env <dev|staging|production>   default: dev
+      --source-env <environment>       source environment for copy
+  -f, --from <file>                    push values from a file
   -d, --dir <path>                     default: current directory
   -y, --yes                            skip confirmations
+  -h, --help                           full help
 ```
 
 ### Status & Drift Detection
@@ -208,43 +215,14 @@ For **staging and production, only keys are compared**: those values are never r
 ```bash
 bws-sync push                        # dev: push every key that is new or changed
 bws-sync push STRIPE_KEY             # dev: push one key
-bws-sync push -e staging             # staging: prompt for each value
+bws-sync push -e staging             # staging: prompt for each key BWS lacks
 bws-sync push -e production API_KEY  # production: prompt for one value
-bws-sync push -e staging --from /dev/shm/staging.env KEY_A KEY_B   # staging: values from a file
+bws-sync push -e staging --from /dev/shm/staging.env   # staging: every key in the file
 ```
 
-For **dev**, values come straight from `.env`. For **staging and production**, the script prompts you for each value with input hidden, like a password prompt, so a pasted secret never lands in terminal scrollback or tmux history. Press Enter to keep whatever BWS already has. Nothing is ever copied from your dev `.env` into a higher environment.
+For **dev**, values come straight from `.env`. For **staging and production**, the script prompts for each value with input hidden, like a password prompt, so a pasted secret never lands in terminal scrollback or tmux history. Bare push asks only for keys BWS lacks; to change an existing value, name the key, and Enter at its prompt keeps what BWS already has. Push never sends your dev `.env` values to a higher environment.
 
-`--from FILE` supplies staging or production values from a file instead of prompts. The file must be gitignored or outside the repo (the push refuses otherwise), and once the values are in BWS it offers to shred it. `/dev/shm` is a RAM disk, so a file there never touches the drive.
-
-### Runtime injection (`bws run`)
-
-Run an application with one environment's BWS project injected only into that
-child process:
-
-```bash
-bws-sync run -e staging -- python my_script.py
-```
-
-This is the local/runtime counterpart to `bitwarden/sm-action`: the application
-keeps reading ordinary environment variables, but no plaintext `.env` file is
-created. The child can read its own environment, so the environment's machine
-account should remain least-privilege and project-scoped.
-
-### Copy named secrets between environments
-
-Provision shared values once without copying and pasting plaintext:
-
-```bash
-bws-sync copy -e production --source-env staging \
-  SANDBOX_SERVICE_URL SANDBOX_SERVICE_TOKEN
-```
-
-`copy` requires explicit key names and never clones a whole project implicitly.
-Values stay in process memory and the output contains only safe workflow
-`UUID > KEY` mappings. Environment-specific credentials should still be created
-independently; for example, copy a shared sandbox service bearer, but generate a
-new run-token signing secret and set the production callback URL separately.
+`--from FILE` supplies values from a `KEY=VALUE` file instead of prompts (or `.env`). Bare push then sends exactly the file's keys. Named keys still win, and any not in the file fall back to prompts (dev: `.env`). The file must be gitignored or outside the repo (the push refuses otherwise), and once the values are in BWS it offers to shred it. On Linux, `/dev/shm` is a RAM disk, so a file there never touches the drive.
 
 ### Pull
 
@@ -253,7 +231,7 @@ bws-sync pull                # rewrite .env from BWS (backs up to .env.bak first
 bws-sync pull DATABASE_URL   # replace one line in .env, leave everything else alone
 ```
 
-Pull is **dev-only**, by design: production values have no business landing in a local file. The named-key form is the one you'll use day to day: a teammate rotates one credential, you pull just that key.
+Pull is **dev-only**, by design: staging and production values have no business landing in a local file. The named-key form is the one you'll use day to day: a teammate rotates one credential, you pull just that key.
 
 A full `pull` shows you exactly what it's about to do (which values get replaced, and which local-only keys will be lost) before it touches the file.
 
@@ -266,6 +244,25 @@ bws-sync prune OLD_API_URL   # delete one
 
 Deletion in BWS is permanent, so this always confirms.
 
+### Copy Named Secrets Between Environments
+
+By default, environments share keys, never values. To reuse a value across environments without pasting plaintext, name it:
+
+```bash
+bws-sync copy -e production --source-env staging SANDBOX_SERVICE_URL SANDBOX_SERVICE_TOKEN
+bws-sync wire -e production SANDBOX_SERVICE_URL SANDBOX_SERVICE_TOKEN
+```
+
+`copy` requires explicit key names and never clones a whole project. Values stay in process memory; the output is only the new `UUID > KEY` mappings. Credentials that should differ per environment (signing secrets, callback URLs) still get pushed separately.
+
+### Run With Secrets Injected
+
+```bash
+bws-sync run -e staging -- python my_script.py
+```
+
+The command runs under `bws run --no-inherit-env`: its environment is the BWS project's secrets and nothing from your shell, and no `.env` is written. The child can read everything it was given, so keep each machine account scoped to its one project.
+
 ### GitHub Actions Integration
 
 ```bash
@@ -273,11 +270,11 @@ bws-sync wire -e production LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET   # add or upd
 bws-sync wire -e production                                         # mirror the whole project
 ```
 
-This updates the `secrets: |` block in the deploy workflow with `UUID > KEY` mappings from BWS, then makes sure the GitHub environment exists and has `BWS_ACCESS_TOKEN` set. Commit the workflow diff afterwards.
+This rewrites the `secrets: |` block (as used by `bitwarden/sm-action`) in the deploy workflow with `UUID > KEY` mappings from BWS. If `gh` is installed and `origin` is on GitHub, it then offers to create the GitHub environment and to set `BWS_ACCESS_TOKEN` on it, only when either is missing. Commit the workflow diff afterwards.
 
-Name the keys you just pushed. Every other line stays exactly where it is, so the diff shows only what you added. Bare `wire` makes the block mirror the whole BWS project, which can hand a deploy secrets meant for something else (a backup job's cloud keys, say), so it lists every line it would add, change or remove and confirms first.
+Name the keys you just pushed: only those lines are added or updated, existing lines keep their order and new keys are appended, so the diff shows only what you meant. Bare `wire` makes the block mirror the whole BWS project, which can hand a deploy secrets meant for something else (a backup job's cloud keys, say), so it previews every line it would add (`+`), change (`~`) or remove (`-`) and confirms first.
 
-Existing lines keep their order; new keys are appended. If a repo's workflow isn't `.github/workflows/deploy-<env>.yml`, name it in `.bws-sync.toml`:
+If a repo's workflow isn't `.github/workflows/deploy-<env>.yml`, name it in `.bws-sync.toml`:
 
 ```toml
 [workflows]
@@ -285,7 +282,7 @@ staging    = ".github/workflows/deploy-api-staging.yml"
 production = ".github/workflows/deploy-api-production.yml"
 ```
 
-Keeping this behind its own command means a routine `push` no longer rewrites files in your repo as a side effect.
+`wire` is its own command so that `push` never edits files in your repo.
 
 ### What Stays Manual
 
@@ -295,7 +292,7 @@ So when you onboard a *new* project, you still do this by hand, once:
 
 1. Create the BWS project (or use `bws project create`).
 2. Create a machine account, and grant it access to that project.
-3. Issue an access token, and paste it into `~/.config/bws-sync/secrets.conf`.
+3. Issue an access token, and paste it into `$BWS_SYNC_CONFIG_DIR/secrets.conf` (default `~/.config/bws-sync/secrets.conf`).
 4. Copy the project ID into `bws-sync init`.
 
 Everything after that, every key, every environment, every rotation, is `bws-sync`.
@@ -304,13 +301,7 @@ Everything after that, every key, every environment, every rotation, is `bws-syn
 
 ## Contributing
 
-Contributions are welcome. If you have a suggestion, please fork the repo and create a pull request, or open an issue with the "enhancement" tag.
-
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/your-feature`)
-3. Commit your Changes (`git commit -m 'Add some feature'`)
-4. Push to the Branch (`git push origin feature/your-feature`)
-5. Open a Pull Request
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md), or open an issue with the "enhancement" label.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
