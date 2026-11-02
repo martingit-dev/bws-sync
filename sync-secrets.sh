@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# bws-sync — drift-first sync between .env and Bitwarden Secrets Manager.
+# bws-sync: drift-first sync between .env and Bitwarden Secrets Manager.
 # Run inside a project. See --help.
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
@@ -19,7 +19,7 @@ CONFIG_FILE="$CONFIG_DIR/secrets.conf"
 
 usage() {
     cat <<EOF
-${BOLD}bws-sync${NC} — keep .env and Bitwarden Secrets Manager in agreement.
+${BOLD}bws-sync${NC}: keep .env and Bitwarden Secrets Manager in agreement.
 Runs against the current directory.
 
 ${BOLD}USAGE${NC}
@@ -28,7 +28,7 @@ ${BOLD}USAGE${NC}
 ${BOLD}COMMANDS${NC}
   ${BOLD}(none)${NC}          Status. Show drift between .env and BWS. Read-only, no
                   prompts, exits 1 if anything differs.
-  ${BOLD}init${NC}            Write .bws-sync.toml — this repo's BWS project IDs, one per
+  ${BOLD}init${NC}            Write .bws-sync.toml: this repo's BWS project IDs, one per
                   environment. Run once per project. Safe to commit.
   ${BOLD}push${NC} [KEY...]   Send values to BWS. No KEY = every key that is new or
                   changed. Named KEYs = only those.
@@ -47,6 +47,9 @@ ${BOLD}COMMANDS${NC}
 ${BOLD}FLAGS${NC}
   -e, --env <dev|staging|production>   Which environment. Default: dev.
       --source-env <environment>       Source environment for copy.
+  -f, --from <file>                    Staging/production values from a file instead
+                                       of prompts. Must be gitignored or outside the
+                                       repo; offered for shredding after the push.
   -d, --dir <path>                     Which project. Default: current directory.
   -y, --yes                            Skip confirmations.
   -h, --help                           This.
@@ -68,9 +71,10 @@ ${BOLD}ENVIRONMENTS${NC}
 
   dev         Values live in .env. Push reads it, pull writes it, status
               compares keys AND values.
-  staging     Values live only in BWS. Push ${BOLD}prompts${NC} you for each one (Enter
-  production  keeps what BWS already has). Status compares keys only — these
-              values are never written to .env or printed. Pull is refused.
+  staging     Values live only in BWS. Push ${BOLD}prompts${NC} you for each one, input
+  production  hidden (Enter keeps what BWS already has), or reads them from
+              --from FILE. Status compares keys only: these values are never
+              written to .env or printed. Pull is refused.
 
 ${BOLD}SETTING UP A NEW ENVIRONMENT${NC}
   Say production, on a project that already has dev working:
@@ -79,15 +83,15 @@ ${BOLD}SETTING UP A NEW ENVIRONMENT${NC}
        grant it access, issue an access token. (No CLI or API exists for this.)
     2. Add the token to \$BWS_SYNC_CONFIG_DIR/secrets.conf as
        BWS_ACCESS_TOKEN_PRODUCTION.
-    3. bws-sync init          — add the production project ID.
+    3. bws-sync init          adds the production project ID.
     4. bws-sync push -e production
          Takes the key list from .env, then prompts for each production value.
          Your dev values are not used. Press Enter to skip a key that doesn't
          apply to production.
-    5. bws-sync wire -e production   — point the workflow at the new UUIDs.
+    5. bws-sync wire -e production   points the workflow at the new UUIDs.
 
 ${BOLD}FILES${NC}
-  .bws-sync.toml   Project UUIDs. Not secret — commit it.
+  .bws-sync.toml   Project UUIDs. Not secret: commit it.
   .env             Real dev values. Gitignore it.
   \$BWS_SYNC_CONFIG_DIR/secrets.conf
                    Access tokens, one per environment. Never in a repo.
@@ -174,21 +178,21 @@ token_for_env() {
 }
 
 load_project() {
-    [[ -f "$PROJECT_FILE" ]] || die "No .bws-sync.toml in $REPO_NAME — run: bws-sync init"
+    [[ -f "$PROJECT_FILE" ]] || die "No .bws-sync.toml in $REPO_NAME. Run: bws-sync init"
 
     ENV_FILE_NAME=$(read_toml env_file)
     ENV_FILE_NAME="${ENV_FILE_NAME:-.env}"
     ENV_FILE="$REPO_PATH/$ENV_FILE_NAME"
 
     PROJECT_ID=$(read_toml "$ENV" projects)
-    [[ -n "$PROJECT_ID" ]] || die "No '$ENV' project ID in .bws-sync.toml — run: bws-sync init"
+    [[ -n "$PROJECT_ID" ]] || die "No '$ENV' project ID in .bws-sync.toml. Run: bws-sync init"
 }
 
 project_for_env() {
     local environment="$1" project
-    [[ -f "$PROJECT_FILE" ]] || die "No .bws-sync.toml in $REPO_NAME — run: bws-sync init"
+    [[ -f "$PROJECT_FILE" ]] || die "No .bws-sync.toml in $REPO_NAME. Run: bws-sync init"
     project=$(read_toml "$environment" projects)
-    [[ -n "$project" ]] || die "No '$environment' project ID in .bws-sync.toml — run: bws-sync init"
+    [[ -n "$project" ]] || die "No '$environment' project ID in .bws-sync.toml. Run: bws-sync init"
     printf '%s' "$project"
 }
 
@@ -205,7 +209,7 @@ read_toml() {
         }' "$PROJECT_FILE"
 }
 
-# Prompt with the current value as the default — so re-running init to add one
+# Prompt with the current value as the default, so re-running init to add one
 # environment doesn't silently drop the others.
 ask_with_default() {
     local label="$1" current="$2" reply
@@ -238,7 +242,7 @@ cmd_init() {
     env_file=$(ask_with_default "env file:  " "${env_file:-.env}")
 
     {
-        echo "# bws-sync — BWS project IDs for this repo."
+        echo "# bws-sync: BWS project IDs for this repo."
         echo "# Project IDs are not secrets: they are inert without an access token,"
         echo "# and tokens live only in $CONFIG_DIR. Safe to commit."
         echo "env_file = \"${env_file:-.env}\""
@@ -249,7 +253,7 @@ cmd_init() {
         [[ -n "$production" ]] && echo "production = \"$production\""
     } > "$PROJECT_FILE"
 
-    log_success "Wrote $PROJECT_FILE — safe to commit"
+    log_success "Wrote $PROJECT_FILE (safe to commit)"
 }
 
 # ---------------------------------------------------------------- state
@@ -288,11 +292,11 @@ fetch_remote() {
     err=$(mktemp)
     if ! json=$(bws secret list "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json 2>"$err"); then
         # bws returns 404 for a project that exists but holds no secrets. That is
-        # the normal state of a project you are about to provision, not an error —
+        # the normal state of a project you are about to provision, not an error,
         # so ask the project endpoint whether the token can actually see it.
         if bws project get "$PROJECT_ID" -t "$ACCESS_TOKEN" -o none &>/dev/null; then
             rm -f "$err"
-            log_info "Project is empty — no secrets in BWS yet" >&2
+            log_info "Project is empty: no secrets in BWS yet" >&2
             return 0
         fi
         log_error "Cannot read project $PROJECT_ID in $ENV"
@@ -311,7 +315,7 @@ fetch_remote() {
 }
 
 # Populates SYNCED / LOCAL_ONLY / REMOTE_ONLY / CHANGED.
-# CHANGED is only computed for dev — staging/prod compare keys, never values.
+# CHANGED is only computed for dev; staging/prod compare keys, never values.
 declare -a SYNCED=() LOCAL_ONLY=() REMOTE_ONLY=() CHANGED=()
 
 diff_state() {
@@ -339,7 +343,7 @@ diff_state() {
 load_state() {
     load_token
     load_project
-    parse_env_file || log_warn "No $ENV_FILE_NAME in $REPO_NAME — comparing against BWS only"
+    parse_env_file || log_warn "No $ENV_FILE_NAME in $REPO_NAME, comparing against BWS only"
     fetch_remote
     diff_state
 }
@@ -370,7 +374,7 @@ cmd_status() {
     if [[ "$ENV" == "dev" ]]; then
         echo -e "  ${DIM}bws-sync push [KEY…]   ·   bws-sync pull [KEY…]   ·   bws-sync prune${NC}"
     else
-        echo -e "  ${DIM}keys only — $ENV values are never read into $ENV_FILE_NAME${NC}"
+        echo -e "  ${DIM}keys only: $ENV values are never read into $ENV_FILE_NAME${NC}"
         echo -e "  ${DIM}bws-sync push -e $ENV [KEY…]   ·   bws-sync prune -e $ENV   ·   bws-sync wire -e $ENV${NC}"
     fi
     echo ""
@@ -418,7 +422,7 @@ load_from_file() {
         [[ "$rel" = /* ]] && rel="$(realpath --relative-to="$REPO_PATH" "$FROM_FILE" 2>/dev/null || echo "$FROM_FILE")"
         if [[ "$rel" != ../* && "$rel" != /* ]] \
            && ! git -C "$REPO_PATH" check-ignore -q "$rel" 2>/dev/null; then
-            log_error "git is not ignoring $rel — it holds plaintext $ENV secrets"
+            log_error "git is not ignoring $rel: it holds plaintext $ENV secrets"
             log_error "Add it to .gitignore, or keep the file outside the repo."
             exit 1
         fi
@@ -432,7 +436,7 @@ load_from_file() {
 shred_from_file() {
     [[ -n "$FROM_FILE" ]] || return 0
     echo ""
-    log_warn "$FROM_FILE still holds plaintext $ENV secrets — BWS has them now."
+    log_warn "$FROM_FILE still holds plaintext $ENV secrets, and BWS has them now."
     if confirm "  Delete it?"; then
         command -v shred &>/dev/null && shred -u "$FROM_FILE" 2>/dev/null || rm -f "$FROM_FILE"
         log_success "Deleted $FROM_FILE"
@@ -447,9 +451,9 @@ cmd_push() {
 
     # Bare push acts on drift only. For dev that's new + changed keys. For
     # staging/production we cannot see drift in values, so it's the keys BWS is
-    # missing — an existing key is changed by naming it, never by Entering past it.
+    # missing; an existing key is changed by naming it, never by Entering past it.
     #
-    # --from narrows rather than widens: if a file is given, it IS the intent —
+    # --from narrows rather than widens: if a file is given, it IS the intent:
     # push exactly its keys. Not every key it declares lives in .env (seed-only
     # secrets, for one), and drift computed from .env would silently drop them.
     local keys=()
@@ -463,7 +467,7 @@ cmd_push() {
         mapfile -t keys < <(printf '%s\n' "${LOCAL_ONLY[@]:-}" | grep -v '^$' || true)
     fi
 
-    (( ${#keys[@]} )) || { log_success "Nothing to push — $ENV has every key in $ENV_FILE_NAME"; return 0; }
+    (( ${#keys[@]} )) || { log_success "Nothing to push: $ENV has every key in $ENV_FILE_NAME"; return 0; }
 
     # Where each value will come from, so the confirmation can say so per key.
     # An explicit --from wins over .env, including for dev.
@@ -501,8 +505,12 @@ cmd_push() {
             prompt)
                 local hint="new"
                 [[ -n "${REMOTE_IDS[$key]:-}" ]] && hint="Enter to keep current"
-                read -rp "$(echo -e "${CYAN}?${NC} $key ${DIM}($hint)${NC}: ")" value
+                # Hidden like a password prompt: an echoed secret outlives the
+                # push in terminal scrollback and tmux history.
+                read -rsp "$(echo -e "${CYAN}?${NC} $key ${DIM}($hint, input hidden)${NC}: ")" value
+                echo ""
                 [[ -z "$value" ]] && { log_info "skipped $key"; continue; }
+                log_info "received $key"
                 put_secret "$key" "$value" ;;
         esac
     done
@@ -525,7 +533,7 @@ warn_if_tracked() {
 
     echo ""
     log_warn "git is not ignoring: $(join_keys "${exposed[@]}")"
-    log_warn "pull writes plaintext secrets there — add to .gitignore first:"
+    log_warn "pull writes plaintext secrets there. Add to .gitignore first:"
     printf '    %s\n' "${exposed[@]}"
     echo ""
     confirm "  Continue anyway?" || exit 1
@@ -557,7 +565,7 @@ replace_env_line() {
 }
 
 cmd_pull() {
-    [[ "$ENV" == "dev" ]] || die "pull is dev-only — staging/production values must not land in $ENV_FILE_NAME"
+    [[ "$ENV" == "dev" ]] || die "pull is dev-only: staging/production values must not land in $ENV_FILE_NAME"
     load_state
 
     (( ${#REMOTE_IDS[@]} )) || die "No secrets in BWS project $PROJECT_ID"
@@ -580,7 +588,7 @@ cmd_pull() {
     echo ""
     echo "Pull $ENV -> $ENV_FILE_NAME (${#keys[@]} secrets):"
     (( ${#CHANGED[@]} ))     && printf "  ${RED}~${NC} %s ${DIM}(local value will be replaced)${NC}\n" "$(join_keys "${CHANGED[@]}")"
-    (( ${#LOCAL_ONLY[@]} ))  && printf "  ${RED}!${NC} %s ${DIM}(local-only — will be LOST)${NC}\n" "$(join_keys "${LOCAL_ONLY[@]}")"
+    (( ${#LOCAL_ONLY[@]} ))  && printf "  ${RED}!${NC} %s ${DIM}(local-only, will be LOST)${NC}\n" "$(join_keys "${LOCAL_ONLY[@]}")"
     (( ${#REMOTE_ONLY[@]} )) && printf "  ${GREEN}+${NC} %s ${DIM}(new)${NC}\n" "$(join_keys "${REMOTE_ONLY[@]}")"
     echo ""
     [[ -f "$ENV_FILE" ]] && log_warn "$ENV_FILE_NAME will be overwritten (backup: $ENV_FILE_NAME.bak)"
@@ -589,7 +597,7 @@ cmd_pull() {
     [[ -f "$ENV_FILE" ]] && cp "$ENV_FILE" "$ENV_FILE.bak"
 
     {
-        echo "# Pulled from Bitwarden Secrets Manager — $(date -Iseconds)"
+        echo "# Pulled from Bitwarden Secrets Manager, $(date -Iseconds)"
         echo "# Project: $PROJECT_ID | Environment: $ENV"
         echo ""
         local key
@@ -611,7 +619,7 @@ cmd_prune() {
     (( ${#keys[@]} )) || { log_success "Nothing to prune"; return 0; }
 
     echo ""
-    log_warn "Delete from BWS $ENV — permanent:"
+    log_warn "Delete from BWS $ENV (permanent):"
     printf '  %s\n' "${keys[@]}"
     echo ""
     confirm "Delete?" || exit 0
@@ -722,7 +730,7 @@ cmd_wire() {
 
     local tmp
     tmp=$(mktemp)
-    # Replace the ENTIRE `secrets: |` block, delimited by indentation — not by
+    # Replace the ENTIRE `secrets: |` block, delimited by indentation, not by
     # matching mapping lines one at a time. Real blocks carry interleaved
     # comments and stale duplicate entries; a line-by-line matcher stops at the
     # first comment and leaves the rest behind, half-wired.
@@ -737,7 +745,7 @@ cmd_wire() {
         in_secrets {
             if ($0 ~ /^[[:space:]]*$/) { next }          # blank line inside block
             match($0, /^[[:space:]]*/)
-            if (RLENGTH > block_indent) { next }          # block content — drop it
+            if (RLENGTH > block_indent) { next }          # block content: drop it
             in_secrets = 0                                # dedented: block over
         }
         { print }
@@ -745,7 +753,7 @@ cmd_wire() {
 
     if cmp -s "$tmp" "$workflow"; then
         rm -f "$tmp"
-        die "Nothing changed in deploy-${ENV}.yml — no 'secrets: |' block with '<uuid> > KEY' lines found"
+        die "Nothing changed in deploy-${ENV}.yml: no 'secrets: |' block with '<uuid> > KEY' lines found"
     fi
     mv "$tmp" "$workflow"
 
@@ -758,7 +766,7 @@ cmd_wire() {
     command -v gh >/dev/null || return 0
 
     if ! gh api "repos/$gh_repo/environments/$ENV" &>/dev/null; then
-        confirm "GitHub environment '$ENV' missing — create it?" || return 0
+        confirm "GitHub environment '$ENV' missing. Create it?" || return 0
         gh api --method PUT "repos/$gh_repo/environments/$ENV" &>/dev/null \
             && log_success "created environment $ENV" || { log_error "failed to create environment"; return 0; }
     fi

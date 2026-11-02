@@ -73,7 +73,7 @@ my-api · dev · .env
   bws-sync push [KEY…]   ·   bws-sync pull [KEY…]   ·   bws-sync prune
 ```
 
-Then you act on it — all of it, or a single key:
+Then you act on it: all of it, or a single key.
 
 ```bash
 bws-sync push                 # push every drifted key
@@ -87,10 +87,10 @@ The `bws` CLI has no notion of a `.env` file, no bulk operations, and no idea wh
 
 | Benefit                     | Details                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Drift detection**         | One zero-prompt command shows exactly which keys are missing, orphaned, or out of date — before you push anything. `bws` alone can't tell you. |
+| **Drift detection**         | One zero-prompt command shows exactly which keys are missing, orphaned, or out of date, before you push anything. `bws` alone can't tell you. |
 | **Bulk + surgical**         | Push or pull your whole `.env` in one go, or a single key when that's all that changed. `bws` creates one secret per invocation.             |
 | **Centralized management**  | Update a secret in one place (Bitwarden) and every service that uses it picks it up. No need to update GitHub, AWS, Vercel, etc. separately. |
-| **Audit trail**             | Bitwarden logs who accessed or changed what and when. GitHub Secrets has no history — once you overwrite a value, the old one is gone.       |
+| **Audit trail**             | Bitwarden logs who accessed or changed what and when. GitHub Secrets has no history: once you overwrite a value, the old one is gone.       |
 | **Granular access control** | Give a teammate access to staging secrets without exposing production. With GitHub Secrets, anyone with repo admin access sees everything.   |
 | **Easy rotation**           | Change a value once in BWS, all pipelines get the new value on next run. No need to touch each repo/environment individually.                |
 | **Scales across repos**     | If you have multiple repos sharing secrets like a database URL or API key, you manage it in one place instead of copy-pasting across repos.  |
@@ -109,7 +109,7 @@ The `bws` CLI has no notion of a `.env` file, no bulk operations, and no idea wh
 - [Bitwarden Secrets Manager CLI (`bws`)](https://bitwarden.com/help/secrets-manager-cli/)
 - [`jq`](https://jqlang.github.io/jq/)
 - Bash 4+ (for associative arrays)
-- [GitHub CLI (`gh`)](https://cli.github.com/) — only for `bws-sync wire`; authenticate via `gh auth login`
+- [GitHub CLI (`gh`)](https://cli.github.com/), only for `bws-sync wire`; authenticate via `gh auth login`
 
 Install on macOS:
 
@@ -127,9 +127,9 @@ brew install bitwarden/bws/bws gh jq
    ln -s "$PWD/bws-sync/sync-secrets.sh" ~/.local/bin/bws-sync
    ```
 
-   You now run `bws-sync` from inside any project — the current directory is the target.
+   You now run `bws-sync` from inside any project: the current directory is the target.
 
-2. Store your BWS access tokens, one per environment. **This file is the only secret on disk** — keep it out of any repo.
+2. Store your BWS access tokens, one per environment. **This file is the only secret on disk**, so keep it out of any repo.
 
    ```bash
    mkdir -p ~/.config/bws-sync
@@ -153,7 +153,7 @@ brew install bitwarden/bws/bws gh jq
      staging:    9a71...
      production:
      env file [.env]:
-   ✓ Wrote .bws-sync.toml — safe to commit
+   ✓ Wrote .bws-sync.toml (safe to commit)
    ```
 
    This writes `.bws-sync.toml`, so you never type a project ID again:
@@ -166,7 +166,7 @@ brew install bitwarden/bws/bws gh jq
    staging = "9a71…"
    ```
 
-   **Commit it.** A BWS project ID is a UUID, not a credential — it is useless without an access token, and tokens live only in `~/.config/bws-sync/`.
+   **Commit it.** A BWS project ID is a UUID, not a credential: it is useless without an access token, and tokens live only in `~/.config/bws-sync/`.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -176,7 +176,7 @@ brew install bitwarden/bws/bws gh jq
 bws-sync [command] [KEY...] [flags]
 
 Commands:
-  (none)     status — show drift between .env and BWS. Read-only, no prompts.
+  (none)     status: show drift between .env and BWS. Read-only, no prompts.
   init       write .bws-sync.toml with this repo's project IDs
   push       push .env values to BWS (all drifted keys, or just KEY...)
   pull       pull BWS values into .env (dev only; all keys, or just KEY...)
@@ -191,7 +191,7 @@ Flags:
 
 ### Status & Drift Detection
 
-Running `bws-sync` with no arguments is the fast path. It reads your `.env`, lists the BWS project, and prints the difference — without prompting, and without writing anything:
+Running `bws-sync` with no arguments is the fast path. It reads your `.env`, lists the BWS project, and prints the difference, without prompting, and without writing anything:
 
 | Marker | Meaning                                        |
 | ------ | ---------------------------------------------- |
@@ -201,7 +201,7 @@ Running `bws-sync` with no arguments is the fast path. It reads your `.env`, lis
 
 It exits `1` when there is drift, so you can drop it into a pre-deploy check or a `Makefile`.
 
-For **staging and production, only keys are compared** — those values are never read into `.env` or printed to your terminal.
+For **staging and production, only keys are compared**: those values are never read into `.env` or printed to your terminal.
 
 ### Push
 
@@ -210,9 +210,12 @@ bws-sync push                        # dev: push every key that is new or change
 bws-sync push STRIPE_KEY             # dev: push one key
 bws-sync push -e staging             # staging: prompt for each value
 bws-sync push -e production API_KEY  # production: prompt for one value
+bws-sync push -e staging --from /dev/shm/staging.env KEY_A KEY_B   # staging: values from a file
 ```
 
-For **dev**, values come straight from `.env`. For **staging and production**, the script prompts you for each value — press Enter to keep whatever BWS already has. Nothing is ever copied from your dev `.env` into a higher environment.
+For **dev**, values come straight from `.env`. For **staging and production**, the script prompts you for each value with input hidden, like a password prompt, so a pasted secret never lands in terminal scrollback or tmux history. Press Enter to keep whatever BWS already has. Nothing is ever copied from your dev `.env` into a higher environment.
+
+`--from FILE` supplies staging or production values from a file instead of prompts. The file must be gitignored or outside the repo (the push refuses otherwise), and once the values are in BWS it offers to shred it. `/dev/shm` is a RAM disk, so a file there never touches the drive.
 
 ### Runtime injection (`bws run`)
 
@@ -250,9 +253,9 @@ bws-sync pull                # rewrite .env from BWS (backs up to .env.bak first
 bws-sync pull DATABASE_URL   # replace one line in .env, leave everything else alone
 ```
 
-Pull is **dev-only**, by design — production values have no business landing in a local file. The named-key form is the one you'll use day to day: a teammate rotates one credential, you pull just that key.
+Pull is **dev-only**, by design: production values have no business landing in a local file. The named-key form is the one you'll use day to day: a teammate rotates one credential, you pull just that key.
 
-A full `pull` shows you exactly what it's about to do — which values get replaced, and which local-only keys will be lost — before it touches the file.
+A full `pull` shows you exactly what it's about to do (which values get replaced, and which local-only keys will be lost) before it touches the file.
 
 ### Prune
 
@@ -275,7 +278,7 @@ Keeping this behind its own command means a routine `push` no longer rewrites fi
 
 ### What Stays Manual
 
-Honest limits. The `bws` CLI exposes only `project`, `secret`, `run`, and `config`. **Machine accounts, access tokens, and granting a machine account access to a project exist only in the Bitwarden web vault** — there is no API or CLI for them.
+Honest limits. The `bws` CLI exposes only `project`, `secret`, `run`, and `config`. **Machine accounts, access tokens, and granting a machine account access to a project exist only in the Bitwarden web vault**: there is no API or CLI for them.
 
 So when you onboard a *new* project, you still do this by hand, once:
 
@@ -284,7 +287,7 @@ So when you onboard a *new* project, you still do this by hand, once:
 3. Issue an access token, and paste it into `~/.config/bws-sync/secrets.conf`.
 4. Copy the project ID into `bws-sync init`.
 
-Everything after that — every key, every environment, every rotation — is `bws-sync`.
+Everything after that, every key, every environment, every rotation, is `bws-sync`.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
