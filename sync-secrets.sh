@@ -424,19 +424,26 @@ select_keys() {
 # ---------------------------------------------------------------- push
 
 put_secret() {
-    local key="$1" value="$2"
+    local key="$1" value="$2" err result msg
+    err=$(mktemp)
+    # `--` ends option parsing, so a value starting with "-" (every PEM key)
+    # is never read as a flag. bws echoes a rejected argument in its error,
+    # so stderr is captured and the value blanked before anything is shown.
     if [[ -n "${REMOTE_IDS[$key]:-}" ]]; then
-        bws secret edit --value "$value" "${REMOTE_IDS[$key]}" -t "$ACCESS_TOKEN" -o none \
-            && log_success "updated $key" || log_error "failed to update $key"
+        if bws secret edit -t "$ACCESS_TOKEN" -o none --value="$value" -- "${REMOTE_IDS[$key]}" 2>"$err"; then
+            log_success "updated $key"
+        else
+            msg=$(head -3 "$err"); log_error "failed to update $key: ${msg//"$value"/<value hidden>}"
+        fi
     else
-        local result
-        if result=$(bws secret create "$key" "$value" "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json); then
+        if result=$(bws secret create -t "$ACCESS_TOKEN" -o json -- "$key" "$value" "$PROJECT_ID" 2>"$err"); then
             REMOTE_IDS["$key"]=$(echo "$result" | jq -r '.id')
             log_success "created $key"
         else
-            log_error "failed to create $key"
+            msg=$(head -3 "$err"); log_error "failed to create $key: ${msg//"$value"/<value hidden>}"
         fi
     fi
+    rm -f "$err"
 }
 
 # --from holds plaintext values for an environment whose values are otherwise
