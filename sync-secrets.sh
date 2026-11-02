@@ -253,6 +253,22 @@ cmd_init() {
     production=$(ask_with_default "production" "$production")
     env_file=$(ask_with_default "env file" "${env_file:-.env}")
 
+    # init owns env_file and [projects]. Every other section ([workflows], or
+    # one added by hand) is the user's and is carried over as written,
+    # together with the comment lines directly above its header.
+    local kept=""
+    [[ -f "$PROJECT_FILE" ]] && kept=$(awk '
+        /^[[:space:]]*\[/ {
+            sec = $0; gsub(/[][[:space:]]/, "", sec)
+            if (sec != "projects") { printf "%s", pending; print }
+            pending = ""; next
+        }
+        sec != "" && sec != "projects" { print; next }
+        /^[[:space:]]*(#|$)/ { pending = pending $0 "\n"; next }
+        { pending = "" }
+    ' "$PROJECT_FILE")
+    kept="${kept#"${kept%%[!$'\n']*}"}"   # one blank line before it, however many there were
+
     {
         echo "# bws-sync: BWS project IDs for this repo."
         echo "# Project IDs are not secrets: they are inert without an access token,"
@@ -263,6 +279,7 @@ cmd_init() {
         [[ -n "$dev" ]]        && echo "dev = \"$dev\""
         [[ -n "$staging" ]]    && echo "staging = \"$staging\""
         [[ -n "$production" ]] && echo "production = \"$production\""
+        [[ -n "$kept" ]] && printf '\n%s\n' "$kept"
     } > "$PROJECT_FILE"
 
     log_success "Wrote $PROJECT_FILE (safe to commit)"
